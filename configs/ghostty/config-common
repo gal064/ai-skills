@@ -1,0 +1,9 @@
+# Dev CLI - Ghostty additions (all platforms)
+# Appended to ~/.config/ghostty/config on Linux. On macOS these same settings
+# live in configs/ghostty/config.
+
+# Option/middle-drag selection lands in the system clipboard
+copy-on-select = clipboard
+
+# NOTE: intentionally no mouse-scroll-multiplier here. On Linux hosts like
+# Omarchy the distro already ships its own value — we don't want to override it.

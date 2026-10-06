@@ -1,0 +1,7 @@
+interface:
+  display_name: "gdev_subagents"
+  short_description: "Orchestrate implementation across worktree subagents."
+  default_prompt: "Use $gdev_subagents to orchestrate this implementation across worktree subagents."
+
+policy:
+  allow_implicit_invocation: false

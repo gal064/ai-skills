@@ -1,0 +1,7 @@
+interface:
+  display_name: "deep-research-pdf"
+  short_description: "Build a verified primary-source reading list and PDF report."
+  default_prompt: "Use $deep-research-pdf to research this question and produce a PDF report."
+
+policy:
+  allow_implicit_invocation: false

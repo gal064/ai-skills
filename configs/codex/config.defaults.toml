@@ -1,0 +1,9 @@
+[features]
+hooks = true
+apps = false
+remote_plugin = false
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "context-remaining", "thread-title", "git-branch"]
+status_line_use_colors = true
+terminal_title = ["activity", "thread-title"]

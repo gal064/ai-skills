@@ -1,0 +1,7 @@
+interface:
+  display_name: "ginterview"
+  short_description: "Interview the user to create an implementation spec."
+  default_prompt: "Use $ginterview to interview me and create a detailed implementation spec."
+
+policy:
+  allow_implicit_invocation: false

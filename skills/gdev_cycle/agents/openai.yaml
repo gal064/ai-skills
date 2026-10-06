@@ -1,0 +1,7 @@
+interface:
+  display_name: "gdev_cycle"
+  short_description: "Implement a plan, review it, then run manual QA."
+  default_prompt: "Use $gdev_cycle to implement the plan, review the changes, and run manual QA."
+
+policy:
+  allow_implicit_invocation: false

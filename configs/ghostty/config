@@ -1,0 +1,15 @@
+# Dev CLI - Ghostty additions
+# Append these lines to ~/.config/ghostty/config
+
+# Pass Option key as Alt/Meta (shell word navigation, Alt-key bindings)
+macos-option-as-alt = true
+
+# Option-drag selection lands in the system clipboard (macOS has no
+# primary selection, so the default copy-on-select target is unreachable).
+copy-on-select = clipboard
+
+# Slow mouse-wheel scrolling: macOS Ghostty defaults to discrete:3
+# (3 lines/notch), which feels fast — drop it to 1. Precision (trackpad) stays
+# at 1. Deliberately macOS-only (not in config-common) so it can't override a
+# Linux distro's own default.
+mouse-scroll-multiplier = precision:1,discrete:1

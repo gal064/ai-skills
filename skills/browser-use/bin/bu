@@ -1,0 +1,827 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+resolve_link_target() {
+  local source_path="$1"
+  local source_dir link_target
+  while [[ -L "$source_path" ]]; do
+    source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+    link_target="$(readlink "$source_path")"
+    if [[ "$link_target" = /* ]]; then
+      source_path="$link_target"
+    else
+      source_path="$source_dir/$link_target"
+    fi
+  done
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  printf '%s/%s\n' "$source_dir" "$(basename "$source_path")"
+}
+
+bu_script_path="$(resolve_link_target "${BASH_SOURCE[0]}")"
+bu_skill_dir="$(cd -P "$(dirname "$bu_script_path")/.." && pwd)"
+bu_config_file="${BU_CONFIG_FILE:-${XDG_CONFIG_HOME:-${HOME}/.config}/browser-use/bu.conf}"
+bu_runtime_base="${BU_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/browser-use-${UID}}"
+bu_runtime_dir=""
+bu_cdp_state_file=""
+
+export BH_HOME="${BH_HOME:-/tmp/browser-harness-${UID}}"
+
+bu_browser_binary=""
+bu_profile_dir=""
+bu_profile_key=""
+
+load_config() {
+  local line key value
+  if [[ ! -f "$bu_config_file" ]]; then
+    echo "bu: configuration not found: $bu_config_file" >&2
+    echo "bu: explicitly ask your agent to install the browser-use skill integration" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" = \#* ]] && continue
+    if [[ "$line" != *=* ]]; then
+      echo "bu: invalid configuration line in $bu_config_file" >&2
+      return 1
+    fi
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      browser_binary) bu_browser_binary="$value" ;;
+      profile_dir) bu_profile_dir="$value" ;;
+      *)
+        echo "bu: unknown configuration key '$key' in $bu_config_file" >&2
+        return 1
+        ;;
+    esac
+  done < "$bu_config_file"
+  if [[ -z "$bu_browser_binary" || -z "$bu_profile_dir" ]]; then
+    echo "bu: configuration must define browser_binary and profile_dir" >&2
+    return 1
+  fi
+  bu_profile_key="$(printf '%s' "$bu_profile_dir" | cksum | tr ' ' '-' | cut -d- -f1-2)"
+  bu_runtime_dir="$bu_runtime_base/profile-$bu_profile_key"
+  bu_cdp_state_file="$bu_runtime_dir/DevToolsActivePort"
+}
+
+require_writable_directory() {
+  local label="$1" directory="$2" probe=""
+  if ! mkdir -p "$directory" 2>/dev/null; then
+    echo "bu: browser-use $label directory is not writable: $directory" >&2
+    echo 'bu: when running from Codex, rerun this bu command with host permissions (sandbox_permissions="require_escalated")' >&2
+    return 1
+  fi
+  probe="$directory/.bu-write-probe.$$.$RANDOM"
+  if ! ( : > "$probe" ) 2>/dev/null; then
+    echo "bu: browser-use $label directory is not writable: $directory" >&2
+    echo 'bu: when running from Codex, rerun this bu command with host permissions (sandbox_permissions="require_escalated")' >&2
+    return 1
+  fi
+  if ! rm -f -- "$probe" 2>/dev/null; then
+    echo "bu: failed to remove browser-use $label write probe: $probe" >&2
+    return 1
+  fi
+}
+
+profile_cdp_url() {
+  local port="" legacy_state_file="$bu_profile_dir/DevToolsActivePort"
+  if [[ ! -f "$bu_cdp_state_file" && -f "$legacy_state_file" ]]; then
+    mkdir -p "$bu_runtime_dir"
+    {
+      sed -n '1,2p' "$legacy_state_file"
+      printf '%s\n' "$bu_profile_dir"
+    } > "$bu_cdp_state_file"
+  fi
+  [[ -f "$bu_cdp_state_file" ]] || return 1
+  [[ "$(sed -n '3p' "$bu_cdp_state_file" 2>/dev/null || true)" == "$bu_profile_dir" ]] || return 1
+  IFS= read -r port < "$bu_cdp_state_file" || true
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+cdp_is_live() {
+  local endpoint="$1"
+  curl -fsS --max-time 1 "${endpoint%/}/json/version" >/dev/null 2>&1
+}
+
+profile_cdp_is_live() {
+  local endpoint="$1" expected_path="" version="" socket_url="" reported_path=""
+  expected_path="$(sed -n '2p' "$bu_cdp_state_file" 2>/dev/null || true)"
+  [[ "$expected_path" == /devtools/browser/* ]] || return 1
+  version="$(curl -fsS --max-time 1 "${endpoint%/}/json/version" 2>/dev/null || true)"
+  [[ -n "$version" ]] || return 1
+  socket_url="$(printf '%s' "$version" | sed -nE 's/.*"webSocketDebuggerUrl"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
+  [[ -n "$socket_url" ]] || return 1
+  reported_path="/${socket_url#*://*/}"
+  [[ "$reported_path" == "$expected_path" ]]
+}
+
+record_profile_cdp() {
+  local endpoint="$1" version="" socket_url="" socket_path="" state_tmp=""
+  version="$(curl -fsS --max-time 1 "${endpoint%/}/json/version" 2>/dev/null || true)"
+  [[ -n "$version" ]] || return 1
+  socket_url="$(printf '%s' "$version" | sed -nE 's/.*"webSocketDebuggerUrl"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
+  [[ -n "$socket_url" ]] || return 1
+  [[ "$socket_url" == "ws://${endpoint#http://}/devtools/browser/"* ]] || return 1
+  socket_path="/${socket_url#*://*/}"
+  state_tmp="$bu_cdp_state_file.tmp.$$"
+  printf '%s\n%s\n%s\n' "${endpoint##*:}" "$socket_path" "$bu_profile_dir" > "$state_tmp"
+  mv -f "$state_tmp" "$bu_cdp_state_file"
+}
+
+allocate_debugging_port() {
+  # Port 0 makes Chrome expose navigator.webdriver=true. Resolve an ephemeral
+  # loopback port first, then pass the resulting nonzero port to Chrome.
+  node -e '
+    const net = require("node:net");
+    const server = net.createServer();
+    server.unref();
+    server.on("error", (error) => {
+      console.error(error.message);
+      process.exit(1);
+    });
+    server.listen({host: "127.0.0.1", port: 0}, () => {
+      const address = server.address();
+      if (!address || typeof address === "string") process.exit(1);
+      console.log(address.port);
+      server.close();
+    });
+  '
+}
+
+recover_linux_display_environment() {
+  local platform="" manager_environment="" key="" value="" candidate="" display_number=""
+  platform="$(uname -s 2>/dev/null || true)"
+  [[ "$platform" == "Linux" ]] || return 0
+
+  if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/${UID}" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/${UID}"
+  fi
+
+  # Respect an explicitly selected display. Otherwise, prefer the graphical
+  # session exported by the user's systemd manager over guessing a socket.
+  if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    manager_environment="$(systemctl --user show-environment 2>/dev/null || true)"
+    while IFS='=' read -r key value; do
+      case "$key" in
+        DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS)
+          [[ -n "$value" ]] && export "$key=$value"
+          ;;
+      esac
+    done <<< "$manager_environment"
+  fi
+
+  # Sandboxed callers may be unable to query the user manager even though
+  # their local desktop sockets remain reachable.
+  if [[ -z "${WAYLAND_DISPLAY:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+      if [[ -S "$candidate" ]]; then
+        export WAYLAND_DISPLAY="${candidate##*/}"
+        export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+        break
+      fi
+    done
+  fi
+  if [[ -z "${DISPLAY:-}" ]]; then
+    for candidate in /tmp/.X11-unix/X*; do
+      [[ -S "$candidate" ]] || continue
+      display_number="${candidate##*/X}"
+      case "$display_number" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      export DISPLAY=":$display_number"
+      export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+      break
+    done
+  fi
+}
+
+launch_configured_browser() {
+  local debugging_port="$1" log_file="$2" platform="" app_bundle="" unit="" main_pid="" attempts=0 env_name=""
+  local launch_mode="${BU_BROWSER_LAUNCH_MODE:-auto}"
+  local -a browser_args=(
+    "--remote-debugging-address=127.0.0.1"
+    "--remote-debugging-port=$debugging_port"
+    "--user-data-dir=$bu_profile_dir"
+    "--no-first-run"
+    "--no-default-browser-check"
+  )
+  local -a manager_environment=()
+
+  case "$launch_mode" in
+    auto|direct|systemd|launchservices) ;;
+    *)
+      echo "bu: invalid BU_BROWSER_LAUNCH_MODE: $launch_mode" >&2
+      return 1
+      ;;
+  esac
+
+  : > "$log_file"
+  platform="$(uname -s 2>/dev/null || true)"
+  if [[ "$launch_mode" =~ ^(auto|systemd)$ && "$platform" == "Linux" ]] &&
+     command -v systemd-run >/dev/null 2>&1 &&
+     command -v systemctl >/dev/null 2>&1 &&
+     systemctl --user show-environment >/dev/null 2>&1; then
+    unit="browser-use-chrome-${bu_profile_key}-${debugging_port}"
+    for env_name in DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_SESSION_TYPE XAUTHORITY DBUS_SESSION_BUS_ADDRESS; do
+      if [[ -n "${!env_name:-}" ]]; then
+        manager_environment+=("--setenv=$env_name=${!env_name}")
+      fi
+    done
+    if systemd-run --user --quiet --collect --service-type=exec \
+      --unit="$unit" \
+      --property="TimeoutStopSec=5s" \
+      --property="StandardOutput=append:$log_file" \
+      --property="StandardError=append:$log_file" \
+      "${manager_environment[@]}" \
+      "$bu_browser_binary" "${browser_args[@]}"; then
+      while (( attempts < 20 )); do
+        main_pid="$(systemctl --user show "$unit.service" --property=MainPID --value 2>/dev/null || true)"
+        [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] && break
+        attempts=$((attempts + 1))
+        sleep 0.05
+      done
+      bu_owned_chrome_pid="$main_pid"
+      bu_owned_launch_backend="systemd"
+      bu_owned_systemd_unit="$unit"
+      bu_launch_accepted=1
+      return 0
+    fi
+    if [[ "$launch_mode" == "systemd" ]]; then
+      echo "bu: failed to launch configured Chrome with the systemd user manager" >&2
+      return 1
+    fi
+    echo "bu: systemd launch failed; falling back to a direct browser launch" >&2
+  fi
+
+  if [[ "$launch_mode" == "systemd" ]]; then
+    echo "bu: the systemd user manager is unavailable" >&2
+    return 1
+  fi
+
+  if [[ "$launch_mode" =~ ^(auto|launchservices)$ && "$platform" == "Darwin" && "$bu_browser_binary" == *.app/Contents/MacOS/* ]] && command -v open >/dev/null 2>&1; then
+    app_bundle="${bu_browser_binary%%.app/Contents/MacOS/*}.app"
+    if open -na "$app_bundle" --stdout "$log_file" --stderr "$log_file" --args "${browser_args[@]}"; then
+      bu_owned_chrome_pid=""
+      bu_owned_launch_backend="launchservices"
+      bu_launch_accepted=1
+      return 0
+    fi
+    if [[ "$launch_mode" == "launchservices" ]]; then
+      echo "bu: failed to launch configured Chrome with macOS LaunchServices" >&2
+      return 1
+    fi
+    echo "bu: LaunchServices launch failed; falling back to a direct browser launch" >&2
+  fi
+
+  if [[ "$launch_mode" == "launchservices" ]]; then
+    echo "bu: macOS LaunchServices is unavailable for the configured browser" >&2
+    return 1
+  fi
+
+  nohup "$bu_browser_binary" "${browser_args[@]}" >"$log_file" 2>&1 &
+  bu_owned_chrome_pid=$!
+  bu_owned_launch_backend="direct"
+  bu_launch_accepted=1
+}
+
+wait_for_profile_cdp() {
+  local attempts=0 endpoint="" lock_port="" lock_dir="$bu_runtime_dir/chrome-start.lock"
+  local attempt_limit="${BU_START_WAIT_ATTEMPTS:-100}"
+  local wait_interval="${BU_START_WAIT_INTERVAL:-0.2}"
+  [[ "$attempt_limit" =~ ^[1-9][0-9]*$ ]] || attempt_limit=100
+  while (( attempts < attempt_limit )); do
+    endpoint="$(profile_cdp_url 2>/dev/null || true)"
+    if [[ -n "$endpoint" ]] && profile_cdp_is_live "$endpoint"; then
+      printf '%s\n' "$endpoint"
+      return 0
+    fi
+    if [[ -f "$lock_dir/port" ]]; then
+      IFS= read -r lock_port < "$lock_dir/port" || lock_port=""
+      if [[ "$lock_port" =~ ^[1-9][0-9]*$ ]]; then
+        endpoint="http://127.0.0.1:$lock_port"
+        if record_profile_cdp "$endpoint" && profile_cdp_is_live "$endpoint"; then
+          printf '%s\n' "$endpoint"
+          return 0
+        fi
+      fi
+    fi
+    attempts=$((attempts + 1))
+    sleep "$wait_interval"
+  done
+  return 1
+}
+
+directory_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+bu_owned_start_lock_dir=""
+bu_owned_start_lock_token=""
+bu_owned_chrome_pid=""
+bu_owned_launch_backend=""
+bu_owned_systemd_unit=""
+bu_launch_accepted=0
+
+clear_start_lock() {
+  local lock_dir="$1"
+  rm -f "$lock_dir/pid" "$lock_dir/port" "$lock_dir/started_at" "$lock_dir/owner" "$lock_dir/backend" "$lock_dir/unit" 2>/dev/null || true
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+
+reclaim_stale_start_lock() {
+  local lock_dir="$1" lock_grace="$2" guard_dir="$1/.reclaim" quarantine=""
+  local started_at="" chrome_pid="" now="" lock_mtime="" lock_age=0 reclaim_lock=0
+  mkdir "$guard_dir" 2>/dev/null || return 1
+
+  IFS= read -r started_at < "$lock_dir/started_at" 2>/dev/null || started_at=""
+  IFS= read -r chrome_pid < "$lock_dir/pid" 2>/dev/null || chrome_pid=""
+  if [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$chrome_pid" 2>/dev/null; then
+    rmdir "$guard_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  now="$(date +%s)"
+  if [[ "$started_at" =~ ^[0-9]+$ ]]; then
+    (( now - started_at >= lock_grace )) && reclaim_lock=1
+  else
+    lock_mtime="$(directory_mtime "$lock_dir" 2>/dev/null || true)"
+    if [[ "$lock_mtime" =~ ^[0-9]+$ ]]; then
+      lock_age=$((now - lock_mtime))
+      (( lock_age >= lock_grace )) && reclaim_lock=1
+    fi
+  fi
+  if [[ "$reclaim_lock" -ne 1 ]]; then
+    rmdir "$guard_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  quarantine="${lock_dir}.reclaimed.$$.$RANDOM"
+  if ! mv "$lock_dir" "$quarantine" 2>/dev/null; then
+    rmdir "$guard_dir" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$quarantine/.reclaim" 2>/dev/null || true
+  clear_start_lock "$quarantine"
+}
+
+release_owned_start_lock() {
+  local recorded_token=""
+  [[ -n "$bu_owned_start_lock_dir" && -d "$bu_owned_start_lock_dir" ]] || return 0
+  IFS= read -r recorded_token < "$bu_owned_start_lock_dir/owner" 2>/dev/null || recorded_token=""
+  [[ -n "$bu_owned_start_lock_token" && "$recorded_token" == "$bu_owned_start_lock_token" ]] || return 0
+  rm -f "$bu_owned_start_lock_dir/pid" "$bu_owned_start_lock_dir/port" "$bu_owned_start_lock_dir/started_at" "$bu_owned_start_lock_dir/owner" "$bu_owned_start_lock_dir/backend" "$bu_owned_start_lock_dir/unit"
+  rmdir "$bu_owned_start_lock_dir" 2>/dev/null || true
+  bu_owned_start_lock_dir=""
+  bu_owned_start_lock_token=""
+}
+
+cleanup_abandoned_owned_start_lock() {
+  if [[ "$bu_launch_accepted" -eq 1 && -z "$bu_owned_chrome_pid" ]]; then
+    return 0
+  fi
+  if [[ -n "$bu_owned_chrome_pid" && "$bu_owned_chrome_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$bu_owned_chrome_pid" 2>/dev/null; then
+    return 0
+  fi
+  release_owned_start_lock
+}
+
+stop_failed_managed_launch() {
+  if [[ "$bu_owned_launch_backend" == "systemd" && -n "$bu_owned_systemd_unit" ]]; then
+    systemctl --user stop "$bu_owned_systemd_unit.service" >/dev/null 2>&1 || true
+    bu_launch_accepted=0
+    bu_owned_chrome_pid=""
+    release_owned_start_lock
+  fi
+}
+
+trap cleanup_abandoned_owned_start_lock EXIT
+
+start_configured_chrome() {
+  local endpoint="" lock_dir log_file chrome_pid debugging_port started_at now attempts lock_backend="" lock_unit=""
+  local lock_grace="${BU_START_LOCK_GRACE:-2}" acquisition_attempt=0
+  load_config
+  if [[ ! -x "$bu_browser_binary" ]]; then
+    echo "bu: configured browser is not executable: $bu_browser_binary" >&2
+    return 1
+  fi
+  require_writable_directory "runtime" "$bu_runtime_dir" || return 1
+  chmod 700 "$bu_runtime_dir" 2>/dev/null || true
+
+  lock_dir="$bu_runtime_dir/chrome-start.lock"
+  endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  if [[ -n "$endpoint" ]] && profile_cdp_is_live "$endpoint"; then
+    clear_start_lock "$lock_dir"
+    printf '%s\n' "$endpoint"
+    return 0
+  fi
+
+  require_writable_directory "profile" "$bu_profile_dir" || return 1
+  chmod 700 "$bu_profile_dir" 2>/dev/null || true
+
+  log_file="$bu_runtime_dir/chrome.log"
+  [[ "$lock_grace" =~ ^[0-9]+$ ]] || lock_grace=2
+  while (( acquisition_attempt < 3 )); do
+    acquisition_attempt=$((acquisition_attempt + 1))
+    if mkdir "$lock_dir" 2>/dev/null; then
+      bu_owned_start_lock_dir="$lock_dir"
+      bu_owned_start_lock_token="$$:${RANDOM}:$(date +%s)"
+      printf '%s\n' "$bu_owned_start_lock_token" > "$lock_dir/owner"
+      date +%s > "$lock_dir/started_at"
+      break
+    fi
+
+    endpoint="$(wait_for_profile_cdp 2>/dev/null || true)"
+    if [[ -n "$endpoint" ]]; then
+      clear_start_lock "$lock_dir"
+      break
+    fi
+
+    started_at=""
+    chrome_pid=""
+    if [[ -f "$lock_dir/started_at" ]]; then
+      IFS= read -r started_at < "$lock_dir/started_at" || started_at=""
+    fi
+    if [[ -f "$lock_dir/pid" ]]; then
+      IFS= read -r chrome_pid < "$lock_dir/pid" || chrome_pid=""
+    fi
+    if [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$chrome_pid" 2>/dev/null; then
+      IFS= read -r lock_backend < "$lock_dir/backend" 2>/dev/null || lock_backend=""
+      IFS= read -r lock_unit < "$lock_dir/unit" 2>/dev/null || lock_unit=""
+      now="$(date +%s)"
+      if [[ "$lock_backend" == "systemd" && "$lock_unit" =~ ^browser-use-chrome-${bu_profile_key}-[1-9][0-9]*$ &&
+            "$started_at" =~ ^[0-9]+$ && $((now - started_at)) -ge "$lock_grace" ]]; then
+        systemctl --user stop "$lock_unit.service" >/dev/null 2>&1 || true
+        chrome_pid=""
+      else
+        break
+      fi
+    fi
+    reclaim_stale_start_lock "$lock_dir" "$lock_grace" || break
+  done
+
+  if [[ -n "$bu_owned_start_lock_dir" ]]; then
+    debugging_port="$(allocate_debugging_port)"
+    if [[ ! "$debugging_port" =~ ^[1-9][0-9]*$ ]]; then
+      echo "bu: failed to allocate a Chrome debugging port" >&2
+      return 1
+    fi
+    printf '%s\n' "$debugging_port" > "$lock_dir/port"
+    recover_linux_display_environment
+    if ! launch_configured_browser "$debugging_port" "$log_file"; then
+      endpoint=""
+      release_owned_start_lock
+      return 1
+    fi
+    chrome_pid="$bu_owned_chrome_pid"
+    if [[ -n "$bu_owned_launch_backend" ]]; then
+      printf '%s\n' "$bu_owned_launch_backend" > "$lock_dir/backend"
+    fi
+    if [[ -n "$bu_owned_systemd_unit" ]]; then
+      printf '%s\n' "$bu_owned_systemd_unit" > "$lock_dir/unit"
+    fi
+    if [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$chrome_pid" > "$lock_dir/pid"
+    fi
+    endpoint="http://127.0.0.1:$debugging_port"
+    attempts=0
+    local attempt_limit="${BU_START_WAIT_ATTEMPTS:-100}"
+    local wait_interval="${BU_START_WAIT_INTERVAL:-0.2}"
+    [[ "$attempt_limit" =~ ^[1-9][0-9]*$ ]] || attempt_limit=100
+    while (( attempts < attempt_limit )); do
+      if record_profile_cdp "$endpoint"; then
+        break
+      fi
+      if [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$chrome_pid" 2>/dev/null; then
+        endpoint=""
+        break
+      fi
+      attempts=$((attempts + 1))
+      sleep "$wait_interval"
+    done
+    if [[ -n "$endpoint" ]] && ! profile_cdp_is_live "$endpoint"; then
+      endpoint=""
+    fi
+    if [[ -n "$endpoint" ]] || { [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$chrome_pid" 2>/dev/null; }; then
+      release_owned_start_lock
+    fi
+  fi
+
+  if [[ -z "$endpoint" ]]; then
+    stop_failed_managed_launch
+    echo "bu: configured Chrome did not expose a CDP endpoint" >&2
+    echo "bu: another Chrome may hold the profile lock: $bu_profile_dir" >&2
+    if [[ -s "$log_file" ]]; then
+      echo "bu: recent Chrome output:" >&2
+      tail -20 "$log_file" >&2
+    fi
+    return 1
+  fi
+  printf '%s\n' "$endpoint"
+}
+
+ensure_cdp_url() {
+  local endpoint=""
+  if [[ -n "${BU_CDP_URL:-}" ]]; then
+    export BU_CDP_URL
+    return 0
+  fi
+  endpoint="$(start_configured_chrome)"
+  export BU_CDP_URL="$endpoint"
+}
+
+chrome_status() {
+  local endpoint=""
+  load_config
+  endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  if [[ -n "$endpoint" ]] && profile_cdp_is_live "$endpoint"; then
+    printf 'running\tbrowser=%s\tprofile=%s\tcdp=%s\n' "$bu_browser_binary" "$bu_profile_dir" "$endpoint"
+    return 0
+  fi
+  printf 'stopped\tbrowser=%s\tprofile=%s\n' "$bu_browser_binary" "$bu_profile_dir"
+  return 1
+}
+
+run_doctor() {
+  local failed=0 endpoint=""
+  if command -v browser-use >/dev/null 2>&1; then
+    echo "ok: browser-use=$(command -v browser-use)"
+  else
+    echo "fail: browser-use is not installed"
+    failed=1
+  fi
+  if [[ -n "${BU_CDP_URL:-}" ]]; then
+    if cdp_is_live "$BU_CDP_URL"; then
+      echo "ok: explicit-cdp=$BU_CDP_URL"
+    else
+      echo "fail: explicit CDP endpoint is unavailable: $BU_CDP_URL"
+      failed=1
+    fi
+    return "$failed"
+  fi
+  if ! load_config; then
+    return 1
+  fi
+  if [[ -x "$bu_browser_binary" ]]; then
+    echo "ok: browser=$bu_browser_binary"
+  else
+    echo "fail: browser is not executable: $bu_browser_binary"
+    failed=1
+  fi
+  if [[ -d "$bu_profile_dir" ]]; then
+    echo "ok: profile=$bu_profile_dir"
+  else
+    echo "fail: profile directory is missing: $bu_profile_dir"
+    failed=1
+  fi
+  endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  if [[ -n "$endpoint" ]] && profile_cdp_is_live "$endpoint"; then
+    echo "ok: cdp=$endpoint"
+  else
+    echo "fail: configured Chrome is not running; use 'bu chrome start'"
+    failed=1
+  fi
+  return "$failed"
+}
+
+bu_sessions_dir() {
+  printf '%s/sessions\n' "$BH_HOME"
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true
+}
+
+session_marker_files() {
+  local id="$1" dir runtime
+  dir="$(bu_sessions_dir)"
+  runtime="$BH_HOME/runtime"
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$dir/$id.lastuse" "$dir/$id.tabs" \
+    "$runtime/bu-bu_$id.pid" "$runtime/bu-bu_$id.sock"
+}
+
+# Newest activity across a session's records. `.tabs` is written once when a
+# tab opens, so an active session is only visible through `.lastuse`.
+session_last_use() {
+  local id="$1" newest=0 marker stamp
+  while IFS= read -r marker; do
+    [[ -e "$marker" ]] || continue
+    stamp="$(file_mtime "$marker")"
+    [[ "$stamp" =~ ^[0-9]+$ ]] || continue
+    if (( stamp > newest )); then
+      newest="$stamp"
+    fi
+  done < <(session_marker_files "$id")
+  printf '%s\n' "$newest"
+}
+
+known_session_ids() {
+  local dir runtime marker id
+  dir="$(bu_sessions_dir)"
+  runtime="$BH_HOME/runtime"
+  {
+    for marker in "$dir"/*.lastuse "$dir"/*.tabs; do
+      [[ -e "$marker" ]] || continue
+      id="$(basename "$marker")"
+      printf '%s\n' "${id%.*}"
+    done
+    # Daemons outlive their records when a stop fails; without this they would
+    # never be swept again.
+    for marker in "$runtime"/bu-bu_*.pid "$runtime"/bu-bu_*.sock; do
+      [[ -e "$marker" ]] || continue
+      id="$(basename "$marker")"
+      id="${id%.*}"
+      printf '%s\n' "${id#bu-bu_}"
+    done
+  } | sort -u
+}
+
+session_tab_ids() {
+  local id="$1" dir
+  dir="$(bu_sessions_dir)"
+  {
+    cat "$dir/$id.tabs" 2>/dev/null || true
+  } | sed 's/[[:space:]]//g' | grep -v '^$' || true
+}
+
+remove_session_records() {
+  local id="$1" dir
+  dir="$(bu_sessions_dir)"
+  rm -f "$dir/$id.tabs" "$dir/$id.lastuse" 2>/dev/null || true
+  # browser-use writes one log per daemon and never removes it, so without this
+  # they accumulate for the life of the machine.
+  rm -f "$BH_HOME/tmp/bu-bu_$id.log" 2>/dev/null || true
+}
+
+# Closing a tab must not depend on the session's daemon: the sessions being
+# swept are exactly the ones whose daemon may already be gone. Chrome accepts
+# the request over its own HTTP endpoint.
+close_session_tabs() {
+  local id="$1" endpoint="${BU_CDP_URL:-}" target_id
+  if [[ -z "$endpoint" ]]; then
+    load_config >/dev/null 2>&1 || return 0
+    endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  fi
+  [[ -n "$endpoint" ]] || return 0
+  cdp_is_live "$endpoint" || return 0
+  while IFS= read -r target_id; do
+    [[ -n "$target_id" ]] || continue
+    curl -fsS --max-time 2 "${endpoint%/}/json/close/$target_id" >/dev/null 2>&1 || true
+  done < <(session_tab_ids "$id")
+}
+
+end_session() {
+  local id="$1"
+  close_session_tabs "$id"
+  BU_NAME="bu_$id" browser-use --reload >/dev/null 2>&1 || true
+  remove_session_records "$id"
+}
+
+# Ends every session idle past BU_SESSION_TTL. Never ends the calling session.
+sweep_expired_sessions() {
+  local ttl="${BU_SESSION_TTL:-3600}" dir now id last
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=3600
+  (( ttl > 0 )) || return 0
+  dir="$(bu_sessions_dir)"
+  [[ -d "$dir" ]] || return 0
+  now="$(date +%s)"
+  # Sweeps are not serialised against each other: end_session is idempotent, so
+  # two of them racing wastes a little work rather than doing any damage.
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if [[ -n "${session_id:-}" && "$id" == "$session_id" ]]; then
+      continue
+    fi
+    last="$(session_last_use "$id")"
+    [[ "$last" =~ ^[0-9]+$ ]] || continue
+    (( last > 0 )) || continue
+    if (( now - last >= ttl )); then
+      # Re-read immediately before ending: the session may have started a new
+      # call while this sweep was working through the list.
+      last="$(session_last_use "$id")"
+      [[ "$last" =~ ^[0-9]+$ ]] || continue
+      (( now - last >= ttl )) || continue
+      end_session "$id"
+    fi
+  done < <(known_session_ids)
+}
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  bu SESSION_ID <<'PY'
+  # browser-use helper calls
+  PY
+
+  bu SESSION_ID --end
+  bu chrome start
+  bu chrome status
+  bu doctor
+  bu remote-view start --ssh USER@HOST --session SESSION_ID
+  bu remote-view status --session SESSION_ID
+  bu remote-view stop --session SESSION_ID
+
+Reuse SESSION_ID to keep the same owned tabs across calls.
+Run `bu SESSION_ID --end` when that workflow is finished; sessions left idle
+longer than BU_SESSION_TTL seconds (default 3600) are ended automatically.
+EOF
+}
+
+case "${1:-}" in
+  --help|-h)
+    print_help
+    exit 0
+    ;;
+  skill)
+    exec cat "$bu_skill_dir/SKILL.md"
+    ;;
+  skill-dir)
+    printf '%s\n' "$bu_skill_dir"
+    exit 0
+    ;;
+  remote-view)
+    shift
+    exec node "$bu_skill_dir/scripts/remote-view.mjs" "$@"
+    ;;
+  chrome)
+    case "${2:-}" in
+      start)
+        BU_CDP_URL="$(start_configured_chrome)"
+        export BU_CDP_URL
+        echo "running: $BU_CDP_URL"
+        ;;
+      status) chrome_status ;;
+      *) echo "usage: bu chrome {start|status}" >&2; exit 2 ;;
+    esac
+    exit
+    ;;
+  --doctor|doctor)
+    run_doctor
+    exit
+    ;;
+  --update)
+    # Every session shares one $BH_HOME, so ending them all here would kill
+    # other agents' live sessions. Leave their daemons alone; a stale one is
+    # replaced on its owner's next call.
+    exec browser-use "$@"
+    ;;
+  --version|auth|recordings|video|telemetry|--reload)
+    exec browser-use "$@"
+    ;;
+esac
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: bu SESSION_ID [browser-use options]" >&2
+  exit 2
+fi
+
+session_id="$1"
+shift
+
+# A leading dash would let `bu --end` be read as a session literally named
+# "--end" rather than as the cleanup command.
+if [[ ! "$session_id" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,60}$ ]]; then
+  echo "bu: SESSION_ID must match [A-Za-z0-9_][A-Za-z0-9_-]{0,60}" >&2
+  exit 2
+fi
+
+export BU_NAME="bu_${session_id}"
+export BU_SESSION_ID="$session_id"
+
+# `--reload` is kept as an alias so existing cleanup habits end the session.
+if [[ "${1:-}" == "--end" || "${1:-}" == "--reload" ]]; then
+  end_session "$session_id"
+  exit 0
+fi
+
+# Arguments and interactive use are passed straight through: neither runs the
+# prelude, so neither owns tabs. Record nothing for them.
+if [[ $# -gt 0 || -t 0 ]]; then
+  ensure_cdp_url
+  exec browser-use "$@"
+fi
+
+mkdir -p "$(bu_sessions_dir)"
+: > "$(bu_sessions_dir)/$session_id.lastuse"
+
+ensure_cdp_url
+
+# Sweep only once the CDP endpoint is known. Sweeping earlier races Chrome
+# startup: close_session_tabs finds no endpoint and returns, but the session
+# records are removed regardless, stranding tabs nothing can reclaim.
+if [[ "${BU_SWEEP_SYNC:-0}" == "1" ]]; then
+  sweep_expired_sessions
+else
+  sweep_expired_sessions >/dev/null 2>&1 &
+fi
+
+{
+  cat "$bu_skill_dir/session_prelude.py"
+  cat
+} | browser-use
