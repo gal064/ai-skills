@@ -121,7 +121,7 @@ export async function mergeWorktreeHandler(
             }
         } else {
             console.log(chalk.blue(`Worktree for branch "${branchName}" at ${targetPath} has been preserved.`));
-            console.log(chalk.yellow(`Run 'gdev wt remove ${branchName}' to clean it up when ready.`));
+            console.log(chalk.yellow(`Run 'gdev remove ${branchName}' to clean it up when ready.`));
         }
 
         console.log(chalk.green("Merge command completed successfully!"));

@@ -56,15 +56,12 @@ program
   .option("-y, --yes", "Apply the explicit selection without confirmation")
   .action((options) => setupConfigs(options));
 
-// --- Subcommand group: git worktree management ---
+// --- Git worktree management ---
 
-const wt = program
-  .command("wt")
-  .description("Git worktree management.");
-
-wt
+program
   .command("new")
-  .argument("[branchName]", "Name of the branch to base this worktree on")
+  .argument("<branchName>", "Name of the branch for this worktree; created from the current branch (or -b) if it doesn't exist")
+  .option("-b, --base <branch>", "Branch to create the new branch from (defaults to the current branch)")
   .option("-p, --path <path>", "Relative path/folder name for new worktree")
   .option(
     "-c, --checkout",
@@ -80,14 +77,14 @@ wt
     "Editor to use for opening the worktree (e.g., code, webstorm, windsurf, etc.)"
   )
   .description(
-    "Create a new worktree for the specified branch, install dependencies if specified, and open in editor."
+    "Create a worktree on a new branch from the current branch (or -b <branch>), install dependencies if specified, and open in editor."
   )
   .action((branchName, options) => {
     const resolvedInstall = resolveInstallOption(options.install);
     newWorktreeHandler(branchName, { ...options, install: resolvedInstall });
   });
 
-wt
+program
   .command("copy")
   .argument("[branchName]", "Name of the branch to create or reuse for the copied worktree")
   .option("-p, --path <path>", "Relative path/folder name for the new worktree")
@@ -107,13 +104,13 @@ wt
     copyWorktreeHandler(branchName, { ...options, install: resolvedInstall });
   });
 
-wt
+program
   .command("list")
   .alias("ls")
   .description("List all existing worktrees for this repository.")
   .action(listWorktreesHandler);
 
-wt
+program
   .command("remove")
   .alias("rm")
   .argument("[pathOrBranch]", "Path of the worktree or branch to remove.")
@@ -127,7 +124,7 @@ wt
   )
   .action(removeWorktreeHandler);
 
-wt
+program
   .command("merge")
   .argument("<branchName>", "Name of the branch to merge from")
   .option("--auto-commit", "Commit uncommitted changes in the target branch before merging", false)
@@ -139,14 +136,14 @@ wt
   )
   .action(mergeWorktreeHandler);
 
-wt
+program
   .command("purge")
   .description(
     "Safely remove all worktrees except for the main branch, with confirmation."
   )
   .action(purgeWorktreesHandler);
 
-wt
+program
   .command("pr")
   .argument(
     "<prNumber>",
@@ -172,7 +169,7 @@ wt
     prWorktreeHandler(prNumber, { ...options, install: resolvedInstall });
   });
 
-wt
+program
   .command("open")
   .argument("[pathOrBranch]", "Path to worktree or branch name to open")
   .option(
@@ -182,7 +179,7 @@ wt
   .description("Open an existing worktree in the editor.")
   .action(openWorktreeHandler);
 
-wt
+program
   .command("extract")
   .argument("[branchName]", "Name of the branch to extract (defaults to current branch)")
   .option("-p, --path <path>", "Relative path/folder name for the worktree")
@@ -202,9 +199,9 @@ wt
     extractWorktreeHandler(branchName, { ...options, install: resolvedInstall });
   });
 
-wt
+program
   .command("config")
-  .description("Manage CLI configuration settings.")
+  .description("Manage worktree configuration settings.")
   .addCommand(
     new Command("set")
       .description("Set a configuration value.")

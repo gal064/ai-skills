@@ -6,9 +6,39 @@ import { confirm } from "@inquirer/prompts";
 import { isMainRepoBare, isWorktreeClean, findRemoteBranch, validateBranchName } from "../utils/git.js";
 import { finalizeWorktree } from "../utils/worktree.js";
 
+/**
+ * Resolve what a new branch starts from: the current branch, or the branch
+ * given with -b (local first, then any remote, then any commit-ish git accepts).
+ */
+async function resolveBase(base?: string): Promise<{ ref: string; label: string }> {
+    if (!base) {
+        const { stdout, exitCode } = await execa("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { reject: false });
+        const current = stdout.trim();
+        if (exitCode !== 0 || !current) {
+            throw new Error("HEAD is detached, so there is no current branch to start from. Pass -b <branch>.");
+        }
+        return { ref: current, label: `${current} (current branch)` };
+    }
+
+    const local = await execa("git", ["show-ref", "--verify", "--quiet", `refs/heads/${base}`], { reject: false });
+    if (local.exitCode === 0) {
+        // Full ref names: a tag with the same short name would make git refuse it as ambiguous.
+        return { ref: `refs/heads/${base}`, label: `${base} (from -b)` };
+    }
+    const { exists, remote } = await findRemoteBranch(base);
+    if (exists) {
+        return { ref: `refs/remotes/${remote}/${base}`, label: `${remote}/${base} (from -b)` };
+    }
+    const commit = await execa("git", ["rev-parse", "--verify", "--quiet", `${base}^{commit}`], { reject: false });
+    if (commit.exitCode === 0) {
+        return { ref: base, label: `${base} (from -b)` };
+    }
+    throw new Error(`Base branch "${base}" was not found locally or on any remote.`);
+}
+
 export async function newWorktreeHandler(
-    branchName: string = "main",
-    options: { path?: string; checkout?: boolean; install?: string; editor?: string }
+    branchName: string,
+    options: { path?: string; checkout?: boolean; base?: string; install?: string; editor?: string }
 ) {
     try {
         // 1. Validate we're in a git repo and resolve the repository root
@@ -63,6 +93,18 @@ export async function newWorktreeHandler(
             : await findRemoteBranch(branchName);
         const branchExists = localExists || existsRemotely;
 
+        if (options.base && directoryExists) {
+            console.error(chalk.red(`❌ ${resolvedPath} already exists, so -b ${options.base} can't apply.`));
+            console.error(chalk.yellow("   Drop -b to reuse it, or pass -p <path> for a new location."));
+            process.exit(1);
+        }
+
+        if (options.base && branchExists) {
+            console.error(chalk.red(`❌ Branch "${branchName}" already exists, so -b ${options.base} can't apply.`));
+            console.error(chalk.yellow("   Drop -b to use the existing branch, or pick a new branch name."));
+            process.exit(1);
+        }
+
         // 4. Create the new worktree or open the editor if it already exists
         if (directoryExists) {
             console.log(chalk.yellow(`Directory already exists at: ${resolvedPath}`));
@@ -94,9 +136,10 @@ export async function newWorktreeHandler(
             }
 
             if (!branchExists) {
-                console.log(chalk.yellow(`Branch "${branchName}" doesn't exist. Creating new branch with worktree...`));
-                // Create a new branch and worktree in one command with -b flag
-                await execa("git", ["worktree", "add", "-b", branchName, resolvedPath]);
+                const base = await resolveBase(options.base);
+                console.log(chalk.bold.cyan(`🌱 New branch "${branchName}" from: ${base.label}`));
+                // --no-track: a remote base must not become the new branch's upstream.
+                await execa("git", ["worktree", "add", "--no-track", "-b", branchName, resolvedPath, base.ref]);
             } else if (!localExists && existsRemotely) {
                 // Remote-only: create a local tracking branch from the remote that
                 // actually has it (fork-aware) rather than relying on git's DWIM guess.

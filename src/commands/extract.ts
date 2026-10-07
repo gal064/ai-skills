@@ -23,7 +23,7 @@ export async function extractWorktreeHandler(
 
             if (!selectedBranch) {
                 console.error(chalk.red("❌ Error: Could not determine current branch (possibly in detached HEAD state)."));
-                console.error(chalk.yellow("Please specify a branch name: gdev wt extract <branch-name>"));
+                console.error(chalk.yellow("Please specify a branch name: gdev extract <branch-name>"));
                 process.exit(1);
             }
 
@@ -50,7 +50,7 @@ export async function extractWorktreeHandler(
         
         if (worktreeBranches.includes(selectedBranch)) {
             console.error(chalk.red(`❌ Error: Branch "${selectedBranch}" already has a worktree.`));
-            console.error(chalk.yellow("Use 'gdev wt list' to see existing worktrees."));
+            console.error(chalk.yellow("Use 'gdev list' to see existing worktrees."));
             process.exit(1);
         }
 

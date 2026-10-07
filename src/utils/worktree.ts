@@ -614,7 +614,9 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     const tryNative = async (): Promise<boolean> => {
         for (const { command, args } of candidates) {
             try {
-                await execa(command, args, { input: text });
+                // wl-copy/xclip fork a child that holds the clipboard; it would keep
+                // captured stdout/stderr pipes open and block until it exits.
+                await execa(command, args, { input: text, stdout: 'ignore', stderr: 'ignore' });
                 return true;
             } catch {
                 // Backend missing or failed; fall through to the next candidate.
@@ -650,7 +652,7 @@ interface FinalizeWorktreeOptions {
 }
 
 /**
- * Shared tail for `gdev wt new` / `gdev wt copy`. Ordered so the worktree is ready to
+ * Shared tail for `gdev new` / `gdev copy`. Ordered so the worktree is ready to
  * work in BEFORE the (possibly slow) dependency install: copy env files +
  * configured extras, open the editor if one is configured, announce readiness
  * and copy a `cd <path>` command to the clipboard, then install dependencies

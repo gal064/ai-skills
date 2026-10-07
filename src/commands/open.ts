@@ -79,13 +79,13 @@ export async function openWorktreeHandler(
     }
 
     // Resolve the editor: explicit -e wins, else the configured default. If
-    // that's "none" (the default), `gdev wt open` has nothing to launch — tell the
+    // that's "none" (the default), `gdev open` has nothing to launch — tell the
     // user how to pick one instead of silently doing nothing.
     const editorCommand = resolveEditor(options.editor);
     if (!editorCommand) {
       console.error(
         chalk.red(
-          "No editor configured. Pass -e <editor>, or set a default with `gdev wt config set editor <name>`."
+          "No editor configured. Pass -e <editor>, or set a default with `gdev config set editor <name>`."
         )
       );
       process.exit(1);

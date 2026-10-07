@@ -50,7 +50,7 @@ export async function prWorktreeHandler(
         const isClean = await isWorktreeClean("."); // Check current directory (main worktree)
         if (!isClean) {
             console.error(chalk.red("❌ Error: Your main worktree is not clean."));
-            console.error(chalk.yellow("Running 'gdev wt pr' requires a clean worktree to safely check out the PR branch temporarily."));
+            console.error(chalk.yellow("Running 'gdev pr' requires a clean worktree to safely check out the PR branch temporarily."));
             console.error(chalk.yellow("Please commit, stash, or discard your changes in the main worktree."));
             console.error(chalk.cyan("Run 'git status' to see the changes."));
             process.exit(1); // Exit cleanly

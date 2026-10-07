@@ -28,7 +28,7 @@ export async function removeWorktreeHandler(
             // No argument: let the user pick from the removable worktrees.
             if (!process.stdin.isTTY) {
                 console.error(chalk.red("A worktree path or branch is required in non-interactive mode."));
-                console.error(chalk.yellow("Run 'gdev wt remove <pathOrBranch>', or use an interactive terminal to pick one."));
+                console.error(chalk.yellow("Run 'gdev remove <pathOrBranch>', or use an interactive terminal to pick one."));
                 process.exit(1);
             }
 
@@ -56,7 +56,7 @@ export async function removeWorktreeHandler(
             if (!targetWorktree) {
                 console.error(chalk.red(`Could not find a worktree for "${pathOrBranch}".`));
                 console.error(
-                    chalk.yellow("Run 'gdev wt list' to see existing worktrees, or 'gdev wt remove' with no argument to pick one.")
+                    chalk.yellow("Run 'gdev list' to see existing worktrees, or 'gdev remove' with no argument to pick one.")
                 );
                 process.exit(1);
             }

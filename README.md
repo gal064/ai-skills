@@ -5,7 +5,7 @@ Skills, Claude Code and Codex configs, and a small CLI that installs them. It st
 It ships one command, `gdev`:
 
 - **`gdev setup`** — a one-command installer for the Claude Code and Codex configs, the skills in `skills/`, the gdev review/QA hooks, the shared `MEMORY.md` instructions, and a small Ghostty config.
-- **`gdev wt`** — git worktree management, built on [John Lindquist's worktree-cli](https://github.com/johnlindquist/worktree-cli).
+- **`gdev new`, `gdev pr`, `gdev list`, …** — git worktree management, built on [John Lindquist's worktree-cli](https://github.com/johnlindquist/worktree-cli).
 
 ## Installation
 
@@ -87,20 +87,24 @@ Every managed block, hook, TOML key, permission, and symlink is idempotent. Exis
 | Claude Code | `~/.claude/settings.json`, `~/.claude/statusline.sh`, optional `~/.claude/skills/*` plus the skill manifest, optional `~/.claude/CLAUDE.md`, and `.dev-setup-managed-permissions.json` when managing approvals |
 | Codex | `${CODEX_HOME:-~/.codex}/{config.toml,hooks.json}`, optional `${CODEX_HOME:-~/.codex}/rules/*`, `${CODEX_HOME:-~/.codex}/dev-disabled-skills/*`, optional `~/.agents/skills/*` plus the skill manifest, and optional `${CODEX_HOME:-~/.codex}/AGENTS.md` |
 
-**Cross-platform (macOS / Linux).** `gdev wt`'s "copy the cd command" step auto-detects a clipboard backend: `pbcopy` on macOS, `wl-copy` on Wayland, `xclip`/`xsel` on X11.
+**Cross-platform (macOS / Linux).** The worktree commands' "copy the cd command" step auto-detects a clipboard backend: `pbcopy` on macOS, `wl-copy` on Wayland, `xclip`/`xsel` on X11.
 
 ---
 
-## `gdev wt` — git worktrees
+## Git worktrees
 
-Every worktree command runs as `gdev wt <command>`. These commands come from [worktree-cli](https://github.com/johnlindquist/worktree-cli) by [John Lindquist](https://github.com/johnlindquist), which this project forked and extended. Thanks, John.
+Every worktree command runs directly as `gdev <command>`. These commands come from [worktree-cli](https://github.com/johnlindquist/worktree-cli) by [John Lindquist](https://github.com/johnlindquist), which this project forked and extended. Thanks, John.
 
 ### Create a new worktree from a branch name
 
 ```bash
-gdev wt new <branchName> [options]
+gdev new <branchName> [options]
 ```
+
+If `<branchName>` doesn't exist yet, it is created from the **current branch**, or from the branch you pass with `-b`. The base is printed before the worktree is created, so a wrong base is easy to spot. With no `-b` and a detached HEAD, the command fails. If `<branchName>` already exists, the worktree checks it out as-is (and `-b` is rejected).
+
 Options:
+- `-b, --base <branch>`: Branch to create the new branch from (local, then any remote; defaults to the current branch)
 - `-p, --path <path>`: Specify a custom path for the worktree
 - `-c, --checkout`: Create new branch if it doesn't exist and checkout automatically
 - `-i, --install [packageManager]`: Package manager to use for installing dependencies (npm, pnpm, bun, uv, skip, auto, etc.). If no value provided, auto-detects. Use `skip` to disable installation.
@@ -108,25 +112,26 @@ Options:
 
 Example:
 ```bash
-gdev wt new feature/login
-gdev wt new feature/chat --checkout
-gdev wt new feature/auth -p ./auth-worktree
-gdev wt new feature/deps -i uv
-gdev wt new feature/vscode -e code
-gdev wt new feature/nodeps -i skip  # Skip dependency installation
-gdev wt new feature/autodetect -i   # Force auto-detect (override config)
+gdev new feature/login
+gdev new feature/hotfix -b main
+gdev new feature/chat --checkout
+gdev new feature/auth -p ./auth-worktree
+gdev new feature/deps -i uv
+gdev new feature/vscode -e code
+gdev new feature/nodeps -i skip  # Skip dependency installation
+gdev new feature/autodetect -i   # Force auto-detect (override config)
 ```
 
-When a worktree is created, the CLI copies the git-ignored local files a fresh checkout needs to be usable — these don't come along with the worktree the way tracked files do. Every `.env*` file found anywhere in the repository is always copied, plus a set of built-in default patterns (`.npmrc`, `app.db`, `settings.local.json`, `*.pem`, `*.key`, the agent-config dirs, …; see `src/config.ts`). You can add your own via `gdev wt config set copy-paths` — these are searched for throughout the entire repository tree (at any depth) and added on top of the defaults.
+When a worktree is created, the CLI copies the git-ignored local files a fresh checkout needs to be usable — these don't come along with the worktree the way tracked files do. Every `.env*` file found anywhere in the repository is always copied, plus a set of built-in default patterns (`.npmrc`, `app.db`, `settings.local.json`, `*.pem`, `*.key`, the agent-config dirs, …; see `src/config.ts`). You can add your own via `gdev config set copy-paths` — these are searched for throughout the entire repository tree (at any depth) and added on top of the defaults.
 
 **Note:** copy-paths match by **basename** and support `*`/`?` **glob** patterns (e.g. `*.pem` copies every PEM key at any depth; `config.local.json` matches that exact name). A pattern that matches a **directory** copies it whole. Directories that already exist in the new worktree (e.g. git-tracked `.claude/`) are skipped.
 
-By default, it auto-detects lockfiles (`uv.lock`, `package-lock.json`, `yarn.lock`) to install dependencies. You can configure the default behavior with `gdev wt config set package-manager <manager>`, or use `--install` to override on a per-command basis. Use `--install skip` to disable installation entirely.
+By default, it auto-detects lockfiles (`uv.lock`, `package-lock.json`, `yarn.lock`) to install dependencies. You can configure the default behavior with `gdev config set package-manager <manager>`, or use `--install` to override on a per-command basis. Use `--install skip` to disable installation entirely.
 
 ### Create a new worktree from a Pull Request number
 
 ```bash
-gdev wt pr <prNumber> [options]
+gdev pr <prNumber> [options]
 ```
 Uses the GitHub CLI (`gh`) to check out the branch associated with the given Pull Request number, sets it up locally to track the correct remote branch (handling forks automatically), and then creates a worktree for it.
 
@@ -142,16 +147,16 @@ Options:
 Example:
 ```bash
 # Create worktree for PR #123
-gdev wt pr 123
+gdev pr 123
 
 # Create worktree for PR #456, install deps with npm, open in vscode
-gdev wt pr 456 -i npm -e code
+gdev pr 456 -i npm -e code
 ```
 
 ### Copy the current worktree state
 
 ```bash
-gdev wt copy [branchName] [options]
+gdev copy [branchName] [options]
 ```
 
 Creates a new worktree seeded from the current HEAD, then mirrors your working tree (staged, unstaged, and untracked changes) into the new location. Useful for cloning an in-progress branch to try out experiments in parallel.
@@ -164,19 +169,19 @@ Options:
 Examples:
 ```bash
 # Create a copy with an auto-generated branch name
-gdev wt copy
+gdev copy
 
 # Create a copy on a named branch and open in VS Code
-gdev wt copy feature/experiment -e code
+gdev copy feature/experiment -e code
 ```
 
 ### Extract an existing branch as a worktree
 
 ```bash
-gdev wt extract [branchName] [options]
+gdev extract [branchName] [options]
 ```
 
-Extracts an existing branch into a new worktree. If no branch is specified, extracts the current branch. Accepts the same `-p`, `-i`, and `-e` options as `gdev wt new`.
+Extracts an existing branch into a new worktree. If no branch is specified, extracts the current branch. Accepts the same `-p`, `-i`, and `-e` options as `gdev new`.
 
 ### Configure default editor
 
@@ -184,22 +189,22 @@ By default no editor is opened (`editor` is set to `none`) — a worktree is cre
 
 ```bash
 # Set default editor
-gdev wt config set editor <editorName>
+gdev config set editor <editorName>
 
 # Examples:
-gdev wt config set editor none     # Don't open anything (the default)
-gdev wt config set editor code     # Use VS Code
-gdev wt config set editor webstorm # Use WebStorm
-gdev wt config set editor cursor   # Use Cursor
+gdev config set editor none     # Don't open anything (the default)
+gdev config set editor code     # Use VS Code
+gdev config set editor webstorm # Use WebStorm
+gdev config set editor cursor   # Use Cursor
 
 # Get current default editor
-gdev wt config get editor
+gdev config get editor
 
 # Show config file location
-gdev wt config path
+gdev config path
 ```
 
-Pass `-e <editor>` to any worktree command to open one for that run without changing the default. `none`, `skip`, and `false` all mean "don't open." (`gdev wt open` always needs an editor, so it errors if neither `-e` nor a default is set.)
+Pass `-e <editor>` to any worktree command to open one for that run without changing the default. `none`, `skip`, and `false` all mean "don't open." (`gdev open` always needs an editor, so it errors if neither `-e` nor a default is set.)
 
 ### Configure copy paths
 
@@ -207,15 +212,15 @@ Pass `-e <editor>` to any worktree command to open one for that run without chan
 
 ```bash
 # Add extra patterns to search for throughout the repo (glob-aware)
-gdev wt config set copy-paths "config.local.json,*.p12"
+gdev config set copy-paths "config.local.json,*.p12"
 
 # Get the effective copy list (defaults + your additions)
-gdev wt config get copy-paths
+gdev config get copy-paths
 ```
 
 **How it works:**
 - `.env*` files are **always** copied automatically (cannot be disabled)
-- The built-in defaults are always applied; `gdev wt config set copy-paths` **adds** to them (it doesn't replace them), so load-bearing files like `.npmrc` can't be dropped by accident
+- The built-in defaults are always applied; `gdev config set copy-paths` **adds** to them (it doesn't replace them), so load-bearing files like `.npmrc` can't be dropped by accident
 - Patterns match by **basename** at any depth and support `*`/`?` **globs** (e.g. `*.pem`, `config.local.json`)
 - A pattern that matches a **directory** copies it whole; a directory already present in the new worktree is skipped
 - Copied secrets (`*.pem`, `service-account.json`, …) are duplicated into each worktree — fine for same-machine local dev
@@ -226,16 +231,16 @@ You can set a default package manager to be used when creating worktrees:
 
 ```bash
 # Set default package manager
-gdev wt config set package-manager <manager>
+gdev config set package-manager <manager>
 
 # Examples:
-gdev wt config set package-manager npm    # Always use npm
-gdev wt config set package-manager pnpm   # Always use pnpm
-gdev wt config set package-manager skip   # Never install dependencies by default
-gdev wt config set package-manager auto   # Auto-detect based on lock files (default)
+gdev config set package-manager npm    # Always use npm
+gdev config set package-manager pnpm   # Always use pnpm
+gdev config set package-manager skip   # Never install dependencies by default
+gdev config set package-manager auto   # Auto-detect based on lock files (default)
 
 # Get current default package manager
-gdev wt config get package-manager
+gdev config get package-manager
 ```
 
 The default package manager setting will be used for all worktree creation commands (`new`, `copy`, `pr`, `extract`) unless overridden with the `-i` flag.
@@ -248,32 +253,32 @@ The default package manager setting will be used for all worktree creation comma
 ### List worktrees
 
 ```bash
-gdev wt list
+gdev list
 ```
 
 ### Open a worktree
 
 ```bash
-gdev wt open [pathOrBranch] [-e <editor>]
+gdev open [pathOrBranch] [-e <editor>]
 ```
 
 ### Remove a worktree
 
 ```bash
-gdev wt remove <pathOrBranch>
+gdev remove <pathOrBranch>
 ```
 
 You can remove a worktree by either its path or branch name:
 ```bash
-gdev wt remove ./feature/login-worktree
-gdev wt remove feature/chat
+gdev remove ./feature/login-worktree
+gdev remove feature/chat
 ```
 
 ### Merge and purge
 
 ```bash
-gdev wt merge <branchName>   # commit + merge the branch into the current one, then clean up
-gdev wt purge                # remove all worktrees except the main branch (with confirmation)
+gdev merge <branchName>   # commit + merge the branch into the current one, then clean up
+gdev purge                # remove all worktrees except the main branch (with confirmation)
 ```
 
 ---
@@ -283,7 +288,7 @@ gdev wt purge                # remove all worktrees except the main branch (with
 - Git
 - Node.js
 - An editor installed and available in PATH (only if you set a default editor or pass `-e`; no editor is opened by default)
-- **GitHub CLI (`gh`) installed and authenticated (for `gdev wt pr`)**
+- **GitHub CLI (`gh`) installed and authenticated (for `gdev pr`)**
 
 ## Development
 
