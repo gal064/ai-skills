@@ -19,8 +19,9 @@ session, JavaScript rendering, or a bot-protected page.
 
 Translate the user's request directly into `bu` calls. Examples show syntax
 only; never treat an example URL or action as the task. Do not run help, port
-checks, or helper discovery first. Never invoke `browser-use` directly for a
-browser workflow.
+checks, or helper discovery first. If the user explicitly asks to connect to
+their main browser, use the `browser-use` CLI directly and bypass the `bu`
+wrapper and workflow; otherwise, use `bu`.
 
 When running `bu` from Codex, execute every `bu` command with host permissions (`sandbox_permissions="require_escalated"`). `bu` requires access to files outside the sandbox.
 
