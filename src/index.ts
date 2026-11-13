@@ -53,6 +53,12 @@ program
   .option("--no-codex-extended-context", "Remove the matching Codex 400,000/360,000 context override")
   .option("--codex-max-subagents", "Set the Codex concurrent subagent limit to 10")
   .option("--no-codex-max-subagents", "Preserve the existing Codex concurrent subagent limit")
+  .option("--disable-claude-connectors", "Disable claude.ai connectors (cloud MCP servers) in Claude Code")
+  .option("--no-disable-claude-connectors", "Preserve the existing Claude Code connector setting")
+  .option("--disable-claude-sync", "Stop syncing claude.ai skills and plugins into Claude Code")
+  .option("--no-disable-claude-sync", "Preserve the existing claude.ai skill/plugin sync settings")
+  .option("--disable-claude-chrome", "Stop Claude in Chrome from connecting at every Claude Code start")
+  .option("--no-disable-claude-chrome", "Preserve the existing Claude in Chrome startup setting")
   .option("-y, --yes", "Apply the explicit selection without confirmation")
   .action((options) => setupConfigs(options));
 

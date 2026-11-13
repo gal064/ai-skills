@@ -16,6 +16,9 @@ state before acting.
 - Use the main account; never send email unless explicitly asked.
 - Compose HTML with Gmail-native styling. Reply drafts use reply-all and a
   visible quote; verify the full timeline, recipients, thread, and attachments.
+  `gmail drafts create --reply-to-message-id` needs `--quote` explicitly. When
+  replying to the user's own sent message, verify `To` is the recipient, not
+  the user.
 - Invites must list the main account as an attendee; being the organizer does
   not count. Also include Google Meet and attendee notifications. Just-me holds
   are private and have no attendees or Meet.

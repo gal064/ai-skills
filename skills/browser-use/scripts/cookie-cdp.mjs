@@ -104,11 +104,13 @@ export function cookieKey(cookie) {
   return `${cookie.domain}\0${cookie.path}\0${cookie.name}\0${partition}`;
 }
 
-// Keeps one socket open so a few calls can share a target session.
+// Keeps one socket open so a few calls can share a target session. The
+// callback also receives on(method, handler) for CDP events.
 export async function cdpSession(webSocketUrl, callback, timeoutMs = 10_000) {
   if (typeof WebSocket !== 'function') throw new Error('This script requires Node.js with global WebSocket support');
   const socket = new WebSocket(webSocketUrl);
   const pending = new Map();
+  const listeners = new Map();
   let nextId = 0;
   const fail = (error) => {
     for (const { reject } of pending.values()) reject(error);
@@ -116,6 +118,10 @@ export async function cdpSession(webSocketUrl, callback, timeoutMs = 10_000) {
   };
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(String(event.data));
+    if (message.method) {
+      for (const handler of listeners.get(message.method) || []) handler(message.params, message.sessionId);
+      return;
+    }
     const entry = pending.get(message.id);
     if (!entry) return;
     pending.delete(message.id);
@@ -143,9 +149,82 @@ export async function cdpSession(webSocketUrl, callback, timeoutMs = 10_000) {
     });
     socket.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
   });
+  const on = (method, handler) => listeners.set(method, [...(listeners.get(method) || []), handler]);
   try {
-    return await callback(send);
+    return await callback(send, on);
   } finally {
     socket.close();
   }
+}
+
+export function normalizeOrigin(value) {
+  let url;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error(`Invalid origin: ${value}`);
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error(`Invalid origin: ${value}`);
+  }
+  return url.origin;
+}
+
+const BLANK_PAGE = Buffer.from('<!doctype html><title></title>').toString('base64');
+
+// Opens a background tab on the origin whose document is a blank page served
+// by Fetch interception, so the site's own scripts never run, then hands the
+// callback an evaluate(expression) bound to that tab.
+export async function withOriginPage(webSocketUrl, origin, callback, dependencies = {}) {
+  const session = dependencies.cdpSession || cdpSession;
+  return await session(webSocketUrl, async (send, on) => {
+    const { targetId } = await send('Target.createTarget', { url: 'about:blank', background: true });
+    try {
+      const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+      on('Fetch.requestPaused', (params, eventSessionId) => {
+        if (eventSessionId !== sessionId) return;
+        send('Fetch.fulfillRequest', {
+          requestId: params.requestId,
+          responseCode: 200,
+          responseHeaders: [{ name: 'Content-Type', value: 'text/html' }],
+          body: BLANK_PAGE,
+        }, sessionId).catch(() => {});
+      });
+      await send('Network.enable', {}, sessionId);
+      await send('Network.setBypassServiceWorker', { bypass: true }, sessionId);
+      // Every request, so a browser-side rewrite such as an HTTPS upgrade
+      // still gets the blank page instead of reaching the site.
+      await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, sessionId);
+      await send('Page.navigate', { url: `${origin}/` }, sessionId);
+      const evaluate = async (expression) => {
+        const { result, exceptionDetails } = await send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+        if (exceptionDetails) throw new Error(`Page evaluation failed on ${origin}`);
+        return result?.value;
+      };
+      const ready = `location.origin === ${JSON.stringify(origin)} && document.readyState === 'complete'`;
+      const deadline = Date.now() + 10_000;
+      while (!(await evaluate(ready).catch(() => false))) {
+        if (Date.now() > deadline) throw new Error(`Timed out opening a blank page on ${origin}`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return await callback(evaluate);
+    } finally {
+      await send('Target.closeTarget', { targetId }).catch(() => {});
+    }
+  });
+}
+
+export async function readLocalStorage(webSocketUrl, origin, dependencies = {}) {
+  return await withOriginPage(webSocketUrl, origin, async (evaluate) => (
+    JSON.parse(await evaluate('JSON.stringify(Object.entries(localStorage))'))
+  ), dependencies);
+}
+
+// Merges entries without clearing other keys, and returns the entries as read
+// back so the caller can verify them.
+export async function writeLocalStorage(webSocketUrl, origin, entries, dependencies = {}) {
+  return await withOriginPage(webSocketUrl, origin, async (evaluate) => {
+    await evaluate(`(() => { for (const [key, value] of ${JSON.stringify(entries)}) localStorage.setItem(key, value); })()`);
+    return JSON.parse(await evaluate('JSON.stringify(Object.entries(localStorage))'));
+  }, dependencies);
 }

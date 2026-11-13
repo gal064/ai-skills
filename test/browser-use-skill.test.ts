@@ -47,6 +47,8 @@ async function readTree(root: string): Promise<string> {
   let content = '';
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const target = path.join(root, entry.name);
+    // Python bytecode is gitignored and embeds its absolute source path.
+    if (entry.name === '__pycache__') continue;
     if (entry.isDirectory()) content += await readTree(target);
     else content += await readFile(target, 'utf8');
   }
@@ -269,6 +271,7 @@ printf '%s\\n' "$*" >> "$FAKE_CHROME_LOG"
     expect(invocations[0]).toMatch(/--remote-debugging-port=[1-9]\d*/);
     expect(invocations[0]).not.toContain('--remote-debugging-port=0');
     expect(invocations[0]).toContain(`--user-data-dir=${profileDir}`);
+    expect(invocations[0]).toContain('--no-startup-window');
     const runtimeEntries = await readdir(runtimeDir);
     const profileRuntime = runtimeEntries.find((entry) => entry.startsWith('profile-'));
     expect(profileRuntime).toBeTruthy();
@@ -607,6 +610,40 @@ esac
     await expect(readFile(invocationLog, 'utf8')).rejects.toThrow();
   });
 
+  it('marks a profile it creates as dedicated with Do Not Track, and leaves an existing profile alone', async () => {
+    const root = await temporaryRoot('bu-seed-');
+    const fakeBin = path.join(root, 'bin');
+    const fakeBrowser = path.join(fakeBin, 'fake-chrome');
+    await writeExecutable(path.join(fakeBin, 'browser-use'), '#!/bin/sh\nexit 0\n');
+    await writeExecutable(path.join(fakeBin, 'curl'), '#!/bin/sh\nexit 1\n');
+    await writeExecutable(fakeBrowser, '#!/bin/sh\nexit 0\n');
+    const start = async (name: string) => {
+      const profileDir = path.join(root, name);
+      const configFile = path.join(root, `${name}.conf`);
+      await writeFile(configFile, `browser_binary=${fakeBrowser}\nprofile_dir=${profileDir}\n`);
+      await run(wrapper, ['chrome', 'start'], {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        BU_CONFIG_FILE: configFile,
+        BU_RUNTIME_DIR: path.join(root, `${name}-runtime`),
+        BU_BROWSER_LAUNCH_MODE: 'direct',
+        BU_START_WAIT_ATTEMPTS: '1',
+        BU_START_WAIT_INTERVAL: '0.05',
+      }).catch(() => undefined);
+      return profileDir;
+    };
+
+    const fresh = await start('fresh');
+    expect(JSON.parse(await readFile(path.join(fresh, 'Default', 'Preferences'), 'utf8'))).toEqual({ enable_do_not_track: true });
+    expect(await readFile(path.join(fresh, '.bu-dedicated-profile'), 'utf8')).toContain('managed-by=browser-use-skill');
+
+    const existingPreferences = path.join(root, 'existing', 'Default', 'Preferences');
+    await mkdir(path.dirname(existingPreferences), { recursive: true });
+    await writeFile(existingPreferences, '{"keep":1}\n');
+    const existing = await start('existing');
+    expect(await readFile(existingPreferences, 'utf8')).toBe('{"keep":1}\n');
+    await expect(readFile(path.join(existing, '.bu-dedicated-profile'), 'utf8')).rejects.toThrow();
+  });
+
   it('does not duplicate a configured Chrome that remains alive beyond the caller wait', async () => {
     const root = await temporaryRoot('bu-slow-start-');
     const fakeBin = path.join(root, 'bin');
@@ -799,6 +836,66 @@ sleep 0.2
     await rm(path.join(`/tmp/browser-harness-${process.getuid?.() ?? 0}`, 'sessions', 'qa_session.lastuse'), { force: true });
   });
 
+  it('adds the Runtime filter to PYTHONPATH for browser-use and keeps the caller value', async () => {
+    const root = await temporaryRoot('bu-pythonpath-');
+    const fakeBin = path.join(root, 'bin');
+    await writeExecutable(path.join(fakeBin, 'browser-use'), '#!/usr/bin/env bash\nprintf "pythonpath=%s\\n" "$PYTHONPATH"\n');
+    const result = await runWithInput(wrapper, ['qa_pythonpath'], '', {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      BU_CDP_URL: 'http://127.0.0.1:48765',
+      BH_HOME: path.join(root, 'bh'),
+      XDG_RUNTIME_DIR: path.join(root, 'xdg-runtime'),
+      BU_SESSION_TTL: '0',
+      PYTHONPATH: '/caller/path',
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(`pythonpath=${path.join(skillDir, 'python')}:/caller/path`);
+  });
+
+  it('drops only the daemon automatic Runtime.enable, and only inside the daemon', async () => {
+    const root = await temporaryRoot('bu-runtime-filter-');
+    const clientModule = `
+class CDPClient:
+    sent = []
+    async def send_raw(self, method, params=None, session_id=None):
+        CDPClient.sent.append((method, params, session_id))
+        return {"sent": method}
+`;
+    const probe = `
+import asyncio
+from cdp_use.client import CDPClient
+
+async def main():
+    client = CDPClient()
+    await client.send_raw("Runtime.enable", session_id="s")
+    await client.send_raw("Page.enable", session_id="s")
+    await client.send_raw("Runtime.enable", {}, session_id="s")
+    print(CDPClient.sent)
+
+asyncio.run(main())
+`;
+    await mkdir(path.join(root, 'cdp_use'));
+    await mkdir(path.join(root, 'browser_harness'));
+    await writeFile(path.join(root, 'cdp_use', '__init__.py'), '');
+    await writeFile(path.join(root, 'cdp_use', 'client.py'), clientModule);
+    await writeFile(path.join(root, 'browser_harness', '__init__.py'), '');
+    await writeFile(path.join(root, 'browser_harness', 'daemon.py'), probe);
+    await writeFile(path.join(root, 'browser_harness', 'other.py'), probe);
+    const python = async (module: string) => await execFileAsync(
+      'uv',
+      ['run', '--no-project', '--offline', 'python', '-m', module],
+      { cwd: root, env: { ...process.env, PYTHONPATH: `${path.join(skillDir, 'python')}:${root}` } },
+    );
+
+    expect((await python('browser_harness.daemon')).stdout.trim()).toBe(
+      "[('Page.enable', None, 's'), ('Runtime.enable', {}, 's')]",
+    );
+    expect((await python('browser_harness.other')).stdout.trim()).toBe(
+      "[('Runtime.enable', None, 's'), ('Page.enable', None, 's'), ('Runtime.enable', {}, 's')]",
+    );
+  });
+
   it('closes a daemon bootstrap tab when the saved target is stale', async () => {
     const root = await temporaryRoot('bu-stale-target-');
     const stateDir = path.join(root, 'sessions');
@@ -944,6 +1041,89 @@ describe('in-memory cookie transfer', () => {
   });
 });
 
+describe('in-memory localStorage transfer', () => {
+  it('normalizes origins and rejects non-web or credentialed values', async () => {
+    const { normalizeOrigin } = await import('../skills/browser-use/scripts/cookie-cdp.mjs');
+    expect(normalizeOrigin(' https://App.Example.com/dashboard?x=1 ')).toBe('https://app.example.com');
+    expect(() => normalizeOrigin('example.com')).toThrow('Invalid origin');
+    expect(() => normalizeOrigin('file:///etc/passwd')).toThrow('Invalid origin');
+    expect(() => normalizeOrigin('https://user:pass@example.com')).toThrow('Invalid origin');
+  });
+
+  it('merges confirmed origins after cookies and verifies every entry', async () => {
+    const { parseArgs, transferCookies } = await import('../skills/browser-use/scripts/transfer-cookies.mjs');
+    const args = parseArgs(['--source-cdp-url', 'http://source', '--destination-cdp-url', 'http://destination', '--domain', 'example.com', '--local-storage-origin', 'https://app.example.com/']);
+    expect(args.localStorageOrigins).toEqual(['https://app.example.com']);
+    const destination = new Map([['existing', 'kept']]);
+    const reads: string[] = [];
+    const result = await transferCookies(args, {
+      webSocketUrlFromCdpUrl: async (url: string) => url.includes('source') ? 'source' : 'destination',
+      cdpRequest: async (_socket: string, method: string) => method === 'Storage.setCookies' ? {} : { cookies: [{ name: 'a', value: 'v', domain: '.example.com', path: '/', expires: -1 }] },
+      readLocalStorage: async (socket: string, origin: string) => { reads.push(`${socket} ${origin}`); return [['token', 'secret']]; },
+      writeLocalStorage: async (_socket: string, _origin: string, entries: [string, string][]) => {
+        for (const [key, value] of entries) destination.set(key, value);
+        return [...destination];
+      },
+    });
+    expect(reads).toEqual(['source https://app.example.com']);
+    expect(destination.get('existing')).toBe('kept');
+    expect(result.localStorage).toEqual([{ origin: 'https://app.example.com', imported: 1, verified: 1 }]);
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it('fails on an empty source origin before writing any cookie or entry', async () => {
+    const { transferCookies } = await import('../skills/browser-use/scripts/transfer-cookies.mjs');
+    const writes: string[] = [];
+    await expect(transferCookies({
+      sourceCdpUrl: 'http://source', destinationCdpUrl: 'http://destination', domains: ['example.com'], all: false,
+      localStorageOrigins: ['https://app.example.com', 'https://empty.example.com'],
+    }, {
+      webSocketUrlFromCdpUrl: async (url: string) => url.includes('source') ? 'source' : 'destination',
+      cdpRequest: async (_socket: string, method: string) => {
+        if (method === 'Storage.setCookies') writes.push(method);
+        return { cookies: [{ name: 'a', value: 'v', domain: '.example.com', path: '/', expires: -1 }] };
+      },
+      readLocalStorage: async (_socket: string, origin: string) => origin.includes('empty') ? [] : [['token', 'secret']],
+      writeLocalStorage: async () => { writes.push('localStorage'); return []; },
+    })).rejects.toThrow('No source localStorage entries for https://empty.example.com');
+    expect(writes).toEqual([]);
+  });
+
+  it('fails on an unverified localStorage write', async () => {
+    const { writeLocalStorageSources } = await import('../skills/browser-use/scripts/transfer-cookies.mjs');
+    await expect(writeLocalStorageSources('destination', [['https://app.example.com', [['token', 'secret']]]], {
+      writeLocalStorage: async () => [['token', 'other']],
+    })).rejects.toThrow('Only 0 of 1 localStorage entries verified');
+  });
+
+  it('serves the origin a blank page so site scripts never run, then closes the tab', async () => {
+    const { readLocalStorage } = await import('../skills/browser-use/scripts/cookie-cdp.mjs');
+    const calls: [string, Record<string, unknown>][] = [];
+    const listeners = new Map<string, (params: unknown, sessionId: string) => void>();
+    const entries = await readLocalStorage('source', 'https://app.example.com', {
+      cdpSession: async (_socket: string, callback: Function) => callback(
+        async (method: string, params: Record<string, unknown> = {}) => {
+          calls.push([method, params]);
+          if (method === 'Target.createTarget') return { targetId: 't1' };
+          if (method === 'Target.attachToTarget') return { sessionId: 's1' };
+          if (method === 'Page.navigate') listeners.get('Fetch.requestPaused')?.({ requestId: 'r1' }, 's1');
+          if (method === 'Runtime.evaluate') {
+            return { result: { value: String(params.expression).startsWith('location.origin') ? true : '[["k","v"]]' } };
+          }
+          return {};
+        },
+        (method: string, handler: (params: unknown, sessionId: string) => void) => listeners.set(method, handler),
+      ),
+    });
+    expect(entries).toEqual([['k', 'v']]);
+    const methods = calls.map(([method]) => method);
+    expect(methods.indexOf('Fetch.enable')).toBeLessThan(methods.indexOf('Page.navigate'));
+    expect(calls.find(([method]) => method === 'Fetch.enable')?.[1]).toEqual({ patterns: [{ urlPattern: '*' }] });
+    expect(calls.find(([method]) => method === 'Fetch.fulfillRequest')?.[1]).toMatchObject({ requestId: 'r1', responseCode: 200 });
+    expect(methods.at(-1)).toBe('Target.closeTarget');
+  });
+});
+
 describe('cookie sync', () => {
   const syncScript = '../skills/browser-use/scripts/sync-cookies.mjs';
 
@@ -958,6 +1138,7 @@ describe('cookie sync', () => {
     expect(() => parseArgs(['--to', '-oProxyCommand=x', '--all', ...profile])).toThrow('Invalid destination');
     expect(() => parseArgs(['--to', 'host', '--all', '--expect', 'x', ...profile])).toThrow('--expect requires --check');
     expect(parseArgs(['--to', 'host', '--domain', '.Example.com', '--profile', 'me@example.com'])).toMatchObject({ to: 'host', domains: ['example.com'], profile: 'me@example.com' });
+    expect(parseArgs(['--to', 'host', '--domain', 'example.com', '--local-storage-origin', 'https://app.example.com', ...profile])).toMatchObject({ localStorageOrigins: ['https://app.example.com'] });
   });
 
   it('parses the bu chrome start endpoint', async () => {

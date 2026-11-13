@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // One command: check the served source profile, resolve the destination bu
-// Chrome (locally or over SSH), tunnel to it, transfer cookies in memory, and
-// optionally check a page in the destination.
+// Chrome (locally or over SSH), tunnel to it, transfer cookies (and optionally
+// localStorage) in memory, and optionally check a page in the destination.
 
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -11,14 +11,14 @@ import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cdpSession, normalizeDomain, webSocketUrlFromCdpUrl, webSocketUrlFromUserDataDir } from './cookie-cdp.mjs';
+import { cdpSession, normalizeDomain, normalizeOrigin, webSocketUrlFromCdpUrl, webSocketUrlFromUserDataDir } from './cookie-cdp.mjs';
 import { transferCookies } from './transfer-cookies.mjs';
 
 const DEFAULT_SOURCE = path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 const CHECK_MARKER = 'SYNC_CHECK ';
 
 export function parseArgs(argv) {
-  const parsed = { domains: [], all: false, sourceUserDataDir: DEFAULT_SOURCE };
+  const parsed = { domains: [], all: false, localStorageOrigins: [], sourceUserDataDir: DEFAULT_SOURCE };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === '--all') {
@@ -28,6 +28,7 @@ export function parseArgs(argv) {
     const value = argv[index + 1];
     if (!value) throw new Error(`Missing value for ${flag}`);
     if (flag === '--domain') parsed.domains.push(normalizeDomain(value));
+    else if (flag === '--local-storage-origin') parsed.localStorageOrigins.push(normalizeOrigin(value));
     else if (flag === '--to') parsed.to = value;
     else if (flag === '--profile') parsed.profile = value;
     else if (flag === '--source-user-data-dir') parsed.sourceUserDataDir = value;
@@ -206,6 +207,7 @@ export async function syncCookies(args, dependencies = {}) {
       destinationCdpUrl,
       domains: args.domains,
       all: args.all,
+      localStorageOrigins: args.localStorageOrigins,
     });
   } finally {
     closeTunnel();

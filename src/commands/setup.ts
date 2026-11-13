@@ -22,13 +22,16 @@ const CLAUDE_MANAGED_PERMISSIONS_FILE = ".dev-setup-managed-permissions.json";
 const CODEX_MANAGED_HOOKS_FILE = ".dev-setup-managed-hooks.json";
 const MANAGED_SKILLS_FILE = ".dev-setup-managed-skills.json";
 const SAVED_SETUP_SELECTION_FILE = "setup-selection.json";
-const SAVED_SETUP_SELECTION_VERSION = 5;
-const LEGACY_SAVED_SETUP_SELECTION_VERSIONS = new Set([1, 2, 3, 4]);
+const SAVED_SETUP_SELECTION_VERSION = 7;
+const LEGACY_SAVED_SETUP_SELECTION_VERSIONS = new Set([1, 2, 3, 4, 5, 6]);
 const CODEX_EXTENDED_CONTEXT_WINDOW = 400_000;
 const CODEX_EXTENDED_AUTO_COMPACT_LIMIT = 360_000;
 const CODEX_EXTENDED_CONTEXT_QUESTION = "Configure Codex with a 400,000-token context window and auto-compact at 360,000 tokens?";
 const CODEX_MAX_CONCURRENT_SUBAGENTS = 10;
 const CODEX_MAX_SUBAGENTS_QUESTION = `Configure Codex to allow up to ${CODEX_MAX_CONCURRENT_SUBAGENTS} concurrent subagents?`;
+const CLAUDE_DISABLE_CONNECTORS_QUESTION = "Disable claude.ai connectors (cloud MCP servers such as Gmail, Slack, and Drive) in Claude Code? They stay connected on claude.ai.";
+const CLAUDE_DISABLE_SYNC_QUESTION = "Stop syncing claude.ai skills and plugins into Claude Code? Already synced ones are hidden and moved to trash at the next launch.";
+const CLAUDE_DISABLE_CHROME_QUESTION = "Stop Claude in Chrome from connecting at every Claude Code start? Use claude --chrome when you want it.";
 // Marker shared by the retired tmux-only notification hooks, used to remove copies setup installed.
 const LEGACY_NOTIFY_MARKER = "Only send custom notifications inside tmux (worktree-cli sessions)";
 const LEGACY_GDEV_AGENT_NAMES = ["gdev-cycle-worker", "gdev-code-review", "gdev-invariant-review", "gdev-design-review", "gdev-qa"] as const;
@@ -50,6 +53,9 @@ export interface SetupOptions {
   disableCodexSkills?: boolean;
   codexExtendedContext?: boolean;
   codexMaxSubagents?: boolean;
+  disableClaudeConnectors?: boolean;
+  disableClaudeSync?: boolean;
+  disableClaudeChrome?: boolean;
 }
 
 interface SetupPrompts {
@@ -80,8 +86,13 @@ interface ResolvedSetup {
   disableCodexSkills: boolean;
   codexExtendedContext: boolean;
   codexMaxSubagents: boolean;
+  disableClaudeConnectors: boolean;
+  disableClaudeSync: boolean;
+  disableClaudeChrome: boolean;
   needsCodexExtendedContextPrompt: boolean;
   needsCodexMaxSubagentsPrompt: boolean;
+  needsClaudeConnectorsPrompt: boolean;
+  needsClaudeSyncAndChromePrompts: boolean;
   skillNames: string[];
   reusedSavedSelection: boolean;
 }
@@ -117,9 +128,9 @@ interface PreparedSetup {
 
 const CLAUDE_ONLY_PERMISSIONS = [
   "mcp__ide",
-  "Read(*)",
-  "Glob(*)",
-  "Grep(*)",
+  "Read",
+  "Glob",
+  "Grep",
   "LS(*)",
   "Agent",
   "TodoRead",
@@ -230,6 +241,9 @@ interface SavedSetupSelection {
   disableCodexSkills: boolean;
   codexExtendedContext: boolean;
   codexMaxSubagents: boolean;
+  disableClaudeConnectors: boolean;
+  disableClaudeSync: boolean;
+  disableClaudeChrome: boolean;
 }
 
 
@@ -303,6 +317,21 @@ async function loadSavedSetupSelection(paths: RuntimePaths): Promise<ResolvedSet
   if (codexMaxSubagents && !agents.has("codex")) {
     throw new Error(`Cannot parse ${filePath}: codexMaxSubagents requires Codex in agents.`);
   }
+  const disableClaudeConnectors = saved.version >= 6
+    ? requireBoolean(saved.disableClaudeConnectors, "disableClaudeConnectors", filePath)
+    : false;
+  if (disableClaudeConnectors && !agents.has("claude")) {
+    throw new Error(`Cannot parse ${filePath}: disableClaudeConnectors requires Claude in agents.`);
+  }
+  const disableClaudeSync = saved.version >= 7
+    ? requireBoolean(saved.disableClaudeSync, "disableClaudeSync", filePath)
+    : false;
+  const disableClaudeChrome = saved.version >= 7
+    ? requireBoolean(saved.disableClaudeChrome, "disableClaudeChrome", filePath)
+    : false;
+  if ((disableClaudeSync || disableClaudeChrome) && !agents.has("claude")) {
+    throw new Error(`Cannot parse ${filePath}: disableClaudeSync and disableClaudeChrome require Claude in agents.`);
+  }
   const terminal = requireBoolean(saved.terminal, "terminal", filePath);
   return {
     terminal,
@@ -317,8 +346,13 @@ async function loadSavedSetupSelection(paths: RuntimePaths): Promise<ResolvedSet
     disableCodexSkills,
     codexExtendedContext,
     codexMaxSubagents,
+    disableClaudeConnectors,
+    disableClaudeSync,
+    disableClaudeChrome,
     needsCodexExtendedContextPrompt: saved.version === 1 && agents.has("codex"),
     needsCodexMaxSubagentsPrompt: saved.version < 3 && agents.has("codex"),
+    needsClaudeConnectorsPrompt: saved.version < 6 && agents.has("claude"),
+    needsClaudeSyncAndChromePrompts: saved.version < 7 && agents.has("claude"),
     skillNames: skills.size > 0 ? await discoverInstallableSkills() : [],
     reusedSavedSelection: true,
   };
@@ -338,6 +372,9 @@ function serializeSetupSelection(setup: ResolvedSetup): string {
     disableCodexSkills: setup.disableCodexSkills,
     codexExtendedContext: setup.codexExtendedContext,
     codexMaxSubagents: setup.codexMaxSubagents,
+    disableClaudeConnectors: setup.disableClaudeConnectors,
+    disableClaudeSync: setup.disableClaudeSync,
+    disableClaudeChrome: setup.disableClaudeChrome,
   };
   return `${JSON.stringify(saved, null, 2)}\n`;
 }
@@ -380,6 +417,18 @@ async function resolveSetup(options: SetupOptions, paths: RuntimePaths): Promise
           default: true,
         });
         saved.needsCodexMaxSubagentsPrompt = false;
+      }
+      if (saved.needsClaudeConnectorsPrompt) {
+        saved.disableClaudeConnectors = await paths.prompts.confirm({
+          message: CLAUDE_DISABLE_CONNECTORS_QUESTION,
+          default: true,
+        });
+        saved.needsClaudeConnectorsPrompt = false;
+      }
+      if (saved.needsClaudeSyncAndChromePrompts) {
+        saved.disableClaudeSync = await paths.prompts.confirm({ message: CLAUDE_DISABLE_SYNC_QUESTION, default: true });
+        saved.disableClaudeChrome = await paths.prompts.confirm({ message: CLAUDE_DISABLE_CHROME_QUESTION, default: true });
+        saved.needsClaudeSyncAndChromePrompts = false;
       }
       return saved;
     }
@@ -424,6 +473,9 @@ async function resolveSetup(options: SetupOptions, paths: RuntimePaths): Promise
   let disableCodexSkills = agents.has("codex") && options.disableCodexSkills !== false;
   let codexExtendedContext = options.codexExtendedContext === true;
   let codexMaxSubagents = options.codexMaxSubagents === true;
+  let disableClaudeConnectors = agents.has("claude") && options.disableClaudeConnectors !== false;
+  let disableClaudeSync = agents.has("claude") && options.disableClaudeSync !== false;
+  let disableClaudeChrome = agents.has("claude") && options.disableClaudeChrome !== false;
   let skillNames: string[] = [];
   const hasMemorySource = await existsEntry(MEMORY_SOURCE);
   const hasAliasesSource = await existsEntry(ALIASES_SOURCE);
@@ -448,6 +500,15 @@ async function resolveSetup(options: SetupOptions, paths: RuntimePaths): Promise
   }
   if (options.codexMaxSubagents !== undefined && !agents.has("codex")) {
     throw new Error("--codex-max-subagents and --no-codex-max-subagents require Codex in --ai.");
+  }
+  if (options.disableClaudeConnectors !== undefined && !agents.has("claude")) {
+    throw new Error("--disable-claude-connectors and --no-disable-claude-connectors require Claude in --ai.");
+  }
+  if (options.disableClaudeSync !== undefined && !agents.has("claude")) {
+    throw new Error("--disable-claude-sync and --no-disable-claude-sync require Claude in --ai.");
+  }
+  if (options.disableClaudeChrome !== undefined && !agents.has("claude")) {
+    throw new Error("--disable-claude-chrome and --no-disable-claude-chrome require Claude in --ai.");
   }
 
   if (paths.isTTY && agents.size > 0 && !options.yes) {
@@ -497,6 +558,18 @@ async function resolveSetup(options: SetupOptions, paths: RuntimePaths): Promise
         default: true,
       });
     }
+    if (agents.has("claude") && options.disableClaudeConnectors === undefined) {
+      disableClaudeConnectors = await paths.prompts.confirm({
+        message: CLAUDE_DISABLE_CONNECTORS_QUESTION,
+        default: true,
+      });
+    }
+    if (agents.has("claude") && options.disableClaudeSync === undefined) {
+      disableClaudeSync = await paths.prompts.confirm({ message: CLAUDE_DISABLE_SYNC_QUESTION, default: true });
+    }
+    if (agents.has("claude") && options.disableClaudeChrome === undefined) {
+      disableClaudeChrome = await paths.prompts.confirm({ message: CLAUDE_DISABLE_CHROME_QUESTION, default: true });
+    }
     if (options.unsafeMode === undefined && agents.has("claude")) {
       unsafeMode = await paths.prompts.confirm({ message: "Hide Claude's dangerous-mode warning prompt?", default: false });
     }
@@ -524,8 +597,13 @@ async function resolveSetup(options: SetupOptions, paths: RuntimePaths): Promise
     disableCodexSkills,
     codexExtendedContext,
     codexMaxSubagents,
+    disableClaudeConnectors,
+    disableClaudeSync,
+    disableClaudeChrome,
     needsCodexExtendedContextPrompt: false,
     needsCodexMaxSubagentsPrompt: false,
+    needsClaudeConnectorsPrompt: false,
+    needsClaudeSyncAndChromePrompts: false,
     skillNames,
     reusedSavedSelection: false,
   };
@@ -599,7 +677,7 @@ export function getMemoryTargets(
   };
 }
 
-async function writeChanged(destination: string, content: string, executable = false): Promise<void> {
+async function writeChanged(destination: string, content: string, executable = false, mode = executable ? 0o755 : undefined): Promise<void> {
   try {
     const stat = await fs.lstat(destination);
     if (!stat.isSymbolicLink() && await fs.readFile(destination, "utf8") === content) {
@@ -610,7 +688,7 @@ async function writeChanged(destination: string, content: string, executable = f
   await fs.mkdir(path.dirname(destination), { recursive: true });
   await backup(destination);
   await removeEntry(destination);
-  await fs.writeFile(destination, content, executable ? { mode: 0o755 } : undefined);
+  await fs.writeFile(destination, content, { mode });
 }
 
 async function copyChanged(source: string, destination: string, executable = false): Promise<void> {
@@ -837,6 +915,13 @@ async function prepareClaude(paths: RuntimePaths, setup: ResolvedSetup): Promise
     managedPermissions = `${JSON.stringify({ allow: permissions }, null, 2)}\n`;
   }
   if (setup.unsafeMode) settings.skipDangerousModePermissionPrompt = true;
+  if (setup.disableClaudeConnectors) settings.disableClaudeAiConnectors = true;
+  if (setup.disableClaudeSync) {
+    settings.syncClaudeAiSkills = false;
+    settings.syncClaudeAiPlugins = false;
+  }
+  // Fail before writing anything if Claude's global state file is malformed.
+  if (setup.disableClaudeChrome) await readJsonObject(claudeStatePath(paths));
   if (setup.remoteControl.has("claude")) settings.agentPushNotifEnabled = true;
   return { settings: `${JSON.stringify(settings, null, 2)}\n`, managedPermissions };
 }
@@ -857,11 +942,25 @@ async function retireLegacyGdevAgents(directory: string, extension: string): Pro
   }
 }
 
+function claudeStatePath(paths: RuntimePaths): string {
+  return path.join(paths.home, ".claude.json");
+}
+
+// Claude Code rewrites ~/.claude.json constantly, so read it at write time and change only one key.
+async function setClaudeStateKey(paths: RuntimePaths, key: string, value: unknown): Promise<void> {
+  const statePath = claudeStatePath(paths);
+  const state = await readJsonObject(statePath);
+  if (state[key] === value) return;
+  state[key] = value;
+  await writeChanged(statePath, `${JSON.stringify(state, null, 2)}\n`, false, 0o600);
+}
+
 async function installClaude(paths: RuntimePaths, setup: ResolvedSetup, prepared: PreparedClaude): Promise<void> {
   const claudeHome = path.join(paths.home, ".claude");
   await removeLegacyNotifier(path.join(claudeHome, "hooks", "notify.sh"));
   await copyChanged(path.join(CONFIGS_DIR, "claude", "statusline.sh"), path.join(claudeHome, "statusline.sh"), true);
   await writeChanged(path.join(claudeHome, "settings.json"), prepared.settings);
+  if (setup.disableClaudeChrome) await setClaudeStateKey(paths, "claudeInChromeDefaultEnabled", false);
   if (prepared.managedPermissions !== undefined) {
     await writeChanged(path.join(claudeHome, CLAUDE_MANAGED_PERMISSIONS_FILE), prepared.managedPermissions);
   }
@@ -992,13 +1091,10 @@ function applyTomlDefaults(content: string, defaults: string): string {
       continue;
     }
     const separator = line.indexOf("=");
-    if (!section || separator < 0) continue;
-    next = setTomlValue(
-      next,
-      section,
-      line.slice(0, separator).trim(),
-      line.slice(separator + 1).trim()
-    );
+    if (separator < 0) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    next = section ? setTomlValue(next, section, key, value) : setTopLevelTomlValue(next, key, value);
   }
   return next;
 }
@@ -1271,6 +1367,15 @@ async function printSummary(setup: ResolvedSetup, paths: RuntimePaths, prepared:
     for (const destination of [path.join(paths.home, ".claude", "settings.json"), path.join(paths.home, ".claude", "statusline.sh")]) console.log(`    ${destination}`);
     if (prepared.claude?.managedPermissions !== undefined) console.log(`    ${path.join(paths.home, ".claude", CLAUDE_MANAGED_PERMISSIONS_FILE)}`);
     if (setup.skills.has("claude")) console.log("    GDEV review/QA handoff hook (ordinary native subagents)");
+    console.log(setup.disableClaudeConnectors
+      ? "  Claude claude.ai connectors: disabled"
+      : "  Claude claude.ai connectors: existing setting preserved");
+    console.log(setup.disableClaudeSync
+      ? "  Claude claude.ai skill/plugin sync: off"
+      : "  Claude claude.ai skill/plugin sync: existing setting preserved");
+    console.log(setup.disableClaudeChrome
+      ? `  Claude in Chrome at startup: off (${claudeStatePath(paths)})`
+      : "  Claude in Chrome at startup: existing setting preserved");
   }
   if (setup.agents.has("codex")) {
     console.log("  Codex destinations:");

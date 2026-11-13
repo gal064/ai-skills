@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -343,6 +343,30 @@ describe("setup bundle isolation and idempotency", () => {
     expect(await readFile(hooksPath, "utf8")).toBe(firstHooks);
   });
 
+  it("makes plain codex use on-request approvals with the auto reviewer", async () => {
+    for (const existing of [
+      "",
+      'approvals_reviewer = "user"\napproval_policy = "never"\n\n[features]\nhooks = false\n',
+      '[projects."/private"]\ntrust_level = "trusted"\n',
+    ]) {
+      const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+      await mkdir(runtime.codexHome, { recursive: true });
+      const configPath = path.join(runtime.codexHome, "config.toml");
+      await writeFile(configPath, existing);
+
+      const options = { ai: "codex", disableCodexSkills: false, yes: true };
+      await setupConfigs(options, runtime);
+      const firstConfig = await readFile(configPath, "utf8");
+      const parsed = parseToml(firstConfig);
+
+      expect(parsed.approval_policy).toBe("on-request");
+      expect(parsed.approvals_reviewer).toBe("auto_review");
+
+      await setupConfigs(options, runtime);
+      expect(await readFile(configPath, "utf8")).toBe(firstConfig);
+    }
+  });
+
   it("removes a transport-less Computer Use MCP stub on Linux", async () => {
     const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
     await mkdir(runtime.codexHome, { recursive: true });
@@ -459,7 +483,7 @@ describe("setup bundle isolation and idempotency", () => {
     const selectionPath = path.join(runtime.configHome, "dev", "setup-selection.json");
     const saved = JSON.parse(await readFile(selectionPath, "utf8"));
     expect(saved).toMatchObject({
-      version: 5,
+      version: 7,
       terminal: true,
       agents: ["codex"],
       skills: ["codex"],
@@ -505,7 +529,7 @@ describe("setup bundle isolation and idempotency", () => {
     expect(migration.confirmMock.mock.calls[1]?.[0].default).toBe(false);
     expect(migration.confirmMock.mock.calls[2]?.[0].default).toBe(true);
     const migrated = JSON.parse(await readFile(selectionPath, "utf8"));
-    expect(migrated).toMatchObject({ version: 5, codexExtendedContext: true, codexMaxSubagents: true });
+    expect(migrated).toMatchObject({ version: 7, codexExtendedContext: true, codexMaxSubagents: true });
     const config = await readFile(path.join(runtime.codexHome, "config.toml"), "utf8");
     expect(config).toContain("model_context_window = 400000");
     expect(config).toContain("model_auto_compact_token_limit = 360000");
@@ -538,7 +562,7 @@ describe("setup bundle isolation and idempotency", () => {
     expect(migration.confirmMock).toHaveBeenCalledTimes(2);
     expect(migration.confirmMock.mock.calls[1]?.[0].default).toBe(true);
     expect(JSON.parse(await readFile(selectionPath, "utf8"))).toMatchObject({
-      version: 5,
+      version: 7,
       codexMaxSubagents: false,
     });
     const config = parseToml(await readFile(path.join(runtime.codexHome, "config.toml"), "utf8"));
@@ -584,10 +608,145 @@ describe("setup bundle isolation and idempotency", () => {
     reused.confirmMock.mockResolvedValue(true);
     await setupConfigs({}, reused.runtime);
 
-    expect(reused.confirmMock).toHaveBeenCalledTimes(1);
+    expect(reused.confirmMock).toHaveBeenCalledTimes(4);
+    expect(reused.confirmMock.mock.calls[1]?.[0].message).toContain("Disable claude.ai connectors");
     const migrated = JSON.parse(await readFile(selectionPath, "utf8"));
-    expect(migrated).toMatchObject({ version: 5, terminal: true, agents: ["claude"] });
+    expect(migrated).toMatchObject({
+      version: 7,
+      terminal: true,
+      agents: ["claude"],
+      disableClaudeConnectors: true,
+      disableClaudeSync: true,
+      disableClaudeChrome: true,
+    });
     expect(migrated.tmuxTitleSync).toBeUndefined();
+  });
+
+  it("asks once for the Claude connectors choice when migrating a version-5 saved selection", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    await setupConfigs({ ai: "claude", disableClaudeConnectors: false, disableClaudeSync: false, disableClaudeChrome: false, yes: true }, runtime);
+    const selectionPath = path.join(runtime.configHome, "dev", "setup-selection.json");
+    const legacy = JSON.parse(await readFile(selectionPath, "utf8"));
+    legacy.version = 5;
+    delete legacy.disableClaudeConnectors;
+    delete legacy.disableClaudeSync;
+    delete legacy.disableClaudeChrome;
+    await writeFile(selectionPath, `${JSON.stringify(legacy, null, 2)}\n`);
+
+    const migration = interactiveRuntime(runtime);
+    migration.confirmMock.mockImplementation(async ({ message }: { message: string }) => {
+      if (message.startsWith("Use this machine's saved setup selection")) return true;
+      if (message.startsWith("Disable claude.ai connectors")) return true;
+      if (message.startsWith("Stop syncing claude.ai skills")) return false;
+      if (message.startsWith("Stop Claude in Chrome")) return false;
+      throw new Error(`Unexpected confirmation: ${message}`);
+    });
+    await setupConfigs({}, migration.runtime);
+
+    expect(migration.confirmMock).toHaveBeenCalledTimes(4);
+    expect(migration.confirmMock.mock.calls[1]?.[0].default).toBe(true);
+    expect(JSON.parse(await readFile(selectionPath, "utf8"))).toMatchObject({
+      version: 7,
+      disableClaudeConnectors: true,
+      disableClaudeSync: false,
+      disableClaudeChrome: false,
+    });
+    const settings = JSON.parse(await readFile(path.join(runtime.home, ".claude", "settings.json"), "utf8"));
+    expect(settings.disableClaudeAiConnectors).toBe(true);
+
+    const reused = interactiveRuntime(runtime);
+    reused.confirmMock.mockResolvedValue(true);
+    await setupConfigs({}, reused.runtime);
+    expect(reused.confirmMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables claude.ai connectors by default and preserves the existing setting when opted out", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    const settingsPath = path.join(runtime.home, ".claude", "settings.json");
+    await setupConfigs({ ai: "claude", yes: true }, runtime);
+    expect(JSON.parse(await readFile(settingsPath, "utf8")).disableClaudeAiConnectors).toBe(true);
+
+    await writeFile(settingsPath, `${JSON.stringify({ disableClaudeAiConnectors: false }, null, 2)}\n`);
+    await setupConfigs({ ai: "claude", disableClaudeConnectors: false, yes: true }, runtime);
+    expect(JSON.parse(await readFile(settingsPath, "utf8")).disableClaudeAiConnectors).toBe(false);
+  });
+
+  it("asks once for the sync and Chrome choices when migrating a version-6 saved selection", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    await setupConfigs({ ai: "claude", disableClaudeSync: false, disableClaudeChrome: false, yes: true }, runtime);
+    const selectionPath = path.join(runtime.configHome, "dev", "setup-selection.json");
+    const legacy = JSON.parse(await readFile(selectionPath, "utf8"));
+    legacy.version = 6;
+    delete legacy.disableClaudeSync;
+    delete legacy.disableClaudeChrome;
+    await writeFile(selectionPath, `${JSON.stringify(legacy, null, 2)}\n`);
+
+    const migration = interactiveRuntime(runtime);
+    migration.confirmMock.mockImplementation(async ({ message, default: fallback }: { message: string; default: boolean }) => {
+      if (message.startsWith("Use this machine's saved setup selection")) return true;
+      if (message.startsWith("Stop syncing claude.ai skills") || message.startsWith("Stop Claude in Chrome")) return fallback;
+      throw new Error(`Unexpected confirmation: ${message}`);
+    });
+    await setupConfigs({}, migration.runtime);
+
+    expect(migration.confirmMock).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(await readFile(selectionPath, "utf8"))).toMatchObject({ version: 7, disableClaudeSync: true, disableClaudeChrome: true });
+    const settings = JSON.parse(await readFile(path.join(runtime.home, ".claude", "settings.json"), "utf8"));
+    expect(settings).toMatchObject({ syncClaudeAiSkills: false, syncClaudeAiPlugins: false });
+    expect(JSON.parse(await readFile(path.join(runtime.home, ".claude.json"), "utf8")).claudeInChromeDefaultEnabled).toBe(false);
+  });
+
+  it("turns off claude.ai sync and Chrome at startup while preserving Claude's global state", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    const statePath = path.join(runtime.home, ".claude.json");
+    await writeFile(statePath, `${JSON.stringify({ numStartups: 3, claudeInChromeDefaultEnabled: true, projects: { "/x": { keep: true } } }, null, 2)}\n`);
+
+    await setupConfigs({ ai: "claude", yes: true }, runtime);
+    const settings = JSON.parse(await readFile(path.join(runtime.home, ".claude", "settings.json"), "utf8"));
+    expect(settings).toMatchObject({ syncClaudeAiSkills: false, syncClaudeAiPlugins: false });
+    const firstState = await readFile(statePath, "utf8");
+    expect(JSON.parse(firstState)).toEqual({ numStartups: 3, claudeInChromeDefaultEnabled: false, projects: { "/x": { keep: true } } });
+
+    await setupConfigs({ ai: "claude", yes: true }, runtime);
+    expect(await readFile(statePath, "utf8")).toBe(firstState);
+    expect(await pathExists(`${statePath}.bak.1`)).toBe(false);
+
+    await writeFile(statePath, `${JSON.stringify({ claudeInChromeDefaultEnabled: true }, null, 2)}\n`);
+    await setupConfigs({ ai: "claude", disableClaudeChrome: false, yes: true }, runtime);
+    expect(JSON.parse(await readFile(statePath, "utf8")).claudeInChromeDefaultEnabled).toBe(true);
+  });
+
+  it.each([false, true])("keeps Claude global state owner-only (existing: %s)", async (existing) => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    const statePath = path.join(runtime.home, ".claude.json");
+    const oldUmask = process.umask(0o022);
+    try {
+      if (existing) await writeFile(statePath, '{"claudeInChromeDefaultEnabled":true}\n', { mode: 0o600 });
+      await setupConfigs({ ai: "claude", yes: true }, runtime);
+      expect((await stat(statePath)).mode & 0o777).toBe(0o600);
+      if (existing) expect((await stat(`${statePath}.bak`)).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(oldUmask);
+    }
+  });
+
+  it("rejects a malformed Claude global state file before writing anything", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    await writeFile(path.join(runtime.home, ".claude.json"), "{not json");
+    await expect(setupConfigs({ ai: "claude", yes: true }, runtime)).rejects.toThrow();
+    expect(await pathExists(path.join(runtime.home, ".claude", "settings.json"))).toBe(false);
+  });
+
+  it("rejects Claude sync and Chrome flags when Claude is not selected", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    await expect(setupConfigs({ ai: "codex", disableClaudeSync: true, yes: true }, runtime)).rejects.toThrow("require Claude in --ai");
+    await expect(setupConfigs({ ai: "codex", disableClaudeChrome: false, yes: true }, runtime)).rejects.toThrow("require Claude in --ai");
+  });
+
+  it("rejects Claude connector flags when Claude is not selected", async () => {
+    const runtime = { ...(await tempHome()), platform: "linux" as const, isTTY: false, shell: "/bin/bash" };
+    await expect(setupConfigs({ ai: "codex", disableClaudeConnectors: true, yes: true }, runtime)).rejects.toThrow("require Claude in --ai");
+    await expect(setupConfigs({ ai: "codex", disableClaudeConnectors: false, yes: true }, runtime)).rejects.toThrow("require Claude in --ai");
   });
 
   it("retires legacy tmux, Fresh, lazygit, and notification files without touching user files", async () => {

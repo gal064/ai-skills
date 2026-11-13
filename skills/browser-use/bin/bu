@@ -26,6 +26,8 @@ bu_runtime_dir=""
 bu_cdp_state_file=""
 
 export BH_HOME="${BH_HOME:-/tmp/browser-harness-${UID}}"
+# Store registrations must keep their meaning across callers in different directories.
+[[ "$BH_HOME" = /* ]] || export BH_HOME="$PWD/$BH_HOME"
 
 bu_browser_binary=""
 bu_profile_dir=""
@@ -201,6 +203,17 @@ recover_linux_display_environment() {
   fi
 }
 
+# bu owns a profile it creates: mark it as dedicated so the final --end closes
+# its Chrome, and turn on Do Not Track for fresh dedicated profiles.
+# Existing profiles are never touched.
+seed_fresh_profile() {
+  [[ -e "$bu_profile_dir/Default/Preferences" ]] && return 0
+  mkdir -p "$bu_profile_dir/Default" || return 1
+  printf '{"enable_do_not_track":true}\n' > "$bu_profile_dir/Default/Preferences"
+  printf 'managed-by=browser-use-skill\n' > "$bu_profile_dir/.bu-dedicated-profile"
+  chmod 600 "$bu_profile_dir/.bu-dedicated-profile"
+}
+
 launch_configured_browser() {
   local debugging_port="$1" log_file="$2" platform="" app_bundle="" unit="" main_pid="" attempts=0 env_name=""
   local launch_mode="${BU_BROWSER_LAUNCH_MODE:-auto}"
@@ -210,6 +223,9 @@ launch_configured_browser() {
     "--user-data-dir=$bu_profile_dir"
     "--no-first-run"
     "--no-default-browser-check"
+    # Session daemons create owned tabs. A browser-created new-tab page
+    # would be unowned and correctly block final-session shutdown.
+    "--no-startup-window"
   )
   local -a manager_environment=()
 
@@ -222,6 +238,7 @@ launch_configured_browser() {
   esac
 
   : > "$log_file"
+  seed_fresh_profile
   platform="$(uname -s 2>/dev/null || true)"
   if [[ "$launch_mode" =~ ^(auto|systemd)$ && "$platform" == "Linux" ]] &&
      command -v systemd-run >/dev/null 2>&1 &&
@@ -589,6 +606,176 @@ run_doctor() {
   return "$failed"
 }
 
+# Session registration and the final shutdown decision share a short-lived
+# profile lock with browser startup. Browser code runs outside that lock.
+bu_lifecycle_lock=""
+bu_call_marker=""
+bu_command_pid=""
+bu_explicit_cdp="${BU_CDP_URL:-}"
+bu_code_call=0
+
+acquire_lifecycle_lock() {
+  local lock_path owner attempt
+  [[ -z "$bu_explicit_cdp" ]] || return 0
+  load_config || return 1
+  require_writable_directory "runtime" "$bu_runtime_dir" || return 1
+  lock_path="$bu_runtime_dir/lifecycle.lock"
+  for (( attempt=0; attempt<300; attempt++ )); do
+    # A dangling symlink publishes its owner atomically, with no interval in
+    # which another process sees an ownerless lock after a crash.
+    if ln -s "${BASHPID:-$$}" "$lock_path" 2>/dev/null; then
+      bu_lifecycle_lock="$lock_path"
+      return 0
+    fi
+    owner="$(readlink "$lock_path" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      if mkdir "$lock_path.reclaim" 2>/dev/null; then
+        if [[ "$(readlink "$lock_path" 2>/dev/null || true)" == "$owner" ]]; then
+          rm -f "$lock_path"
+        fi
+        rmdir "$lock_path.reclaim" 2>/dev/null || true
+      fi
+    fi
+    sleep 0.1
+  done
+  echo 'bu: could not acquire the browser lifecycle lock' >&2
+  return 1
+}
+
+release_lifecycle_lock() {
+  [[ -n "$bu_lifecycle_lock" ]] || return 0
+  if [[ "$(readlink "$bu_lifecycle_lock" 2>/dev/null || true)" == "${BASHPID:-$$}" ]]; then
+    rm -f "$bu_lifecycle_lock"
+  fi
+  bu_lifecycle_lock=""
+}
+
+register_browser_call() {
+  local store_key
+  [[ -z "$bu_explicit_cdp" ]] || return 0
+  mkdir -p "$bu_runtime_dir/calls" "$bu_runtime_dir/session-stores"
+  store_key="$(printf '%s' "$BH_HOME" | cksum | tr ' ' '-' | cut -d- -f1-2)"
+  printf '%s\n' "$BH_HOME" > "$bu_runtime_dir/session-stores/$store_key"
+  bu_call_marker="$bu_runtime_dir/calls/$$"
+  printf '%s\n%s\n' "$session_id" "$BH_HOME" > "$bu_call_marker"
+}
+
+session_has_running_call() {
+  local id="$1" marker pid
+  [[ -n "$bu_runtime_dir" ]] || return 1
+  for marker in "$bu_runtime_dir"/calls/*; do
+    [[ -f "$marker" ]] || continue
+    pid="${marker##*/}"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+      if [[ "$(sed -n '1p' "$marker")" == "$id" && "$(sed -n '2p' "$marker")" == "$BH_HOME" ]]; then
+        return 0
+      fi
+    else
+      rm -f "$marker"
+    fi
+  done
+  return 1
+}
+
+check_unassigned_tabs() {
+  local mode="$1" endpoint ttl="${BU_SESSION_TTL:-3600}"
+  [[ -z "$bu_explicit_cdp" && -n "$bu_lifecycle_lock" ]] || return 0
+  endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  [[ -n "$endpoint" ]] || return 0
+  node "$bu_skill_dir/scripts/sweep-unassigned-tabs.mjs" \
+    "$bu_profile_dir" "$bu_cdp_state_file" "$endpoint" "$BH_HOME" "$$" "$mode" "$ttl" ||
+    echo 'bu: unassigned-tab cleanup could not be checked' >&2
+}
+
+stop_unused_chrome() {
+  local marker pid store ancestor endpoint
+  [[ -z "$bu_explicit_cdp" && -n "$bu_lifecycle_lock" ]] || return 0
+  for marker in "$bu_runtime_dir"/calls/*; do
+    [[ -f "$marker" ]] || continue
+    pid="${marker##*/}"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$marker"
+  done
+  # Include the current store for sessions created before lifecycle tracking
+  # was installed, plus other BH_HOME stores registered with this profile.
+  [[ -z "$(known_session_ids)" ]] || return 0
+  for marker in "$bu_runtime_dir"/session-stores/*; do
+    [[ -f "$marker" ]] || continue
+    IFS= read -r store < "$marker" || return 0
+    # Find the nearest existing ancestor: an entire temporary parent may
+    # have been deleted. An inaccessible ancestor is not proof of absence.
+    ancestor="$store"
+    while [[ ! -e "$ancestor" && "$ancestor" != / && "$ancestor" != . ]]; do
+      ancestor="$(dirname "$ancestor")"
+    done
+    if [[ "$ancestor" != "$store" && -x "$ancestor" ]]; then
+      rm -f "$marker"
+      continue
+    fi
+    [[ -d "$store" && -r "$store" && -x "$store" ]] || return 0
+    [[ -z "$(BH_HOME="$store" known_session_ids)" ]] || return 0
+  done
+  endpoint="$(profile_cdp_url 2>/dev/null || true)"
+  [[ -n "$endpoint" ]] || return 0
+  node "$bu_skill_dir/scripts/close-unused-chrome.mjs" "$bu_profile_dir" "$bu_cdp_state_file" "$endpoint" ||
+    echo 'bu: session ended, but Chrome shutdown could not be checked' >&2
+}
+
+cleanup_browser_call() {
+  local completed_call="$bu_call_marker"
+  [[ -z "$bu_call_marker" ]] || rm -f "$bu_call_marker"
+  release_lifecycle_lock
+  cleanup_abandoned_owned_start_lock
+  # The final --end may have deferred shutdown for this command. Recheck
+  # after it exits, without closing workflows that retain session records.
+  if [[ -n "$completed_call" ]] && acquire_lifecycle_lock; then
+    if [[ "$bu_code_call" -eq 1 ]]; then
+      check_unassigned_tabs sweep
+    else
+      check_unassigned_tabs observe
+    fi
+    stop_unused_chrome
+    release_lifecycle_lock
+  fi
+}
+
+interrupt_browser_call() {
+  local signal="$1" status="$2"
+  if [[ -n "$bu_command_pid" ]]; then
+    kill -s "$signal" "$bu_command_pid" 2>/dev/null || true
+    wait "$bu_command_pid" 2>/dev/null || true
+  fi
+  exit "$status"
+}
+
+run_browser_command() {
+  local status=0
+  # Forward signals only while supervising browser-use. Leaving the shell's
+  # default handling in place during startup keeps it immediately cancelable.
+  trap 'interrupt_browser_call INT 130' INT
+  trap 'interrupt_browser_call TERM 143' TERM
+  # Explicitly inherit stdin: an asynchronous shell command otherwise gets
+  # /dev/null, even when this function is receiving the caller's code pipe.
+  (
+    # Bash ignores SIGINT for asynchronous commands. Restore it before exec
+    # so browser-use can still handle Ctrl-C when the wrapper forwards it.
+    trap - INT
+    # Keeps the session daemon from enabling CDP Runtime; see sitecustomize.py.
+    export PYTHONPATH="$bu_skill_dir/python${PYTHONPATH:+:$PYTHONPATH}"
+    exec browser-use "$@"
+  ) <&0 &
+  bu_command_pid=$!
+  wait "$bu_command_pid" || status=$?
+  bu_command_pid=""
+  trap - INT TERM
+  return "$status"
+}
+
+trap cleanup_browser_call EXIT
+
+
 bu_sessions_dir() {
   printf '%s/sessions\n' "$BH_HOME"
 }
@@ -691,8 +878,7 @@ sweep_expired_sessions() {
   dir="$(bu_sessions_dir)"
   [[ -d "$dir" ]] || return 0
   now="$(date +%s)"
-  # Sweeps are not serialised against each other: end_session is idempotent, so
-  # two of them racing wastes a little work rather than doing any damage.
+  acquire_lifecycle_lock || return 0
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     if [[ -n "${session_id:-}" && "$id" == "$session_id" ]]; then
@@ -707,9 +893,11 @@ sweep_expired_sessions() {
       last="$(session_last_use "$id")"
       [[ "$last" =~ ^[0-9]+$ ]] || continue
       (( now - last >= ttl )) || continue
+      session_has_running_call "$id" && continue
       end_session "$id"
     fi
   done < <(known_session_ids)
+  release_lifecycle_lock
 }
 
 print_help() {
@@ -729,7 +917,11 @@ Usage:
 
 Reuse SESSION_ID to keep the same owned tabs across calls.
 Run `bu SESSION_ID --end` when that workflow is finished; sessions left idle
-longer than BU_SESSION_TTL seconds (default 3600) are ended automatically.
+longer than BU_SESSION_TTL seconds (default 3600) are ended on a later code call.
+Unassigned page tabs expire after BU_SESSION_TTL seconds since first observed,
+checked on later code or session-ending calls. Set BU_SESSION_TTL=0 to disable expiry.
+Ending the final session also closes dedicated Chrome if no page tabs remain.
+The next browser call starts Chrome again with the same saved profile.
 EOF
 }
 
@@ -752,7 +944,9 @@ case "${1:-}" in
   chrome)
     case "${2:-}" in
       start)
+        acquire_lifecycle_lock
         BU_CDP_URL="$(start_configured_chrome)"
+        release_lifecycle_lock
         export BU_CDP_URL
         echo "running: $BU_CDP_URL"
         ;;
@@ -796,32 +990,51 @@ export BU_SESSION_ID="$session_id"
 
 # `--reload` is kept as an alias so existing cleanup habits end the session.
 if [[ "${1:-}" == "--end" || "${1:-}" == "--reload" ]]; then
-  end_session "$session_id"
+  if acquire_lifecycle_lock; then
+    check_unassigned_tabs sweep
+    end_session "$session_id"
+    check_unassigned_tabs observe
+    stop_unused_chrome
+    release_lifecycle_lock
+  else
+    # Browser shutdown is optional; preserve the original session cleanup.
+    end_session "$session_id"
+    echo 'bu: session ended, but Chrome shutdown could not be checked' >&2
+  fi
   exit 0
 fi
 
-# Arguments and interactive use are passed straight through: neither runs the
-# prelude, so neither owns tabs. Record nothing for them.
+# Register before connecting, while holding the same lock final cleanup uses.
+# Passthrough calls have only an in-flight marker, never owned-session records.
+acquire_lifecycle_lock
+register_browser_call
+if [[ $# -eq 0 && ! -t 0 ]]; then
+  bu_code_call=1
+  mkdir -p "$(bu_sessions_dir)"
+  : > "$(bu_sessions_dir)/$session_id.lastuse"
+fi
+ensure_cdp_url
+if [[ "$bu_code_call" -eq 1 ]]; then
+  check_unassigned_tabs observe
+fi
+release_lifecycle_lock
+
 if [[ $# -gt 0 || -t 0 ]]; then
-  ensure_cdp_url
-  exec browser-use "$@"
+  run_browser_command "$@"
+  exit $?
 fi
 
-mkdir -p "$(bu_sessions_dir)"
-: > "$(bu_sessions_dir)/$session_id.lastuse"
-
-ensure_cdp_url
-
 # Sweep only once the CDP endpoint is known. Sweeping earlier races Chrome
-# startup: close_session_tabs finds no endpoint and returns, but the session
-# records are removed regardless, stranding tabs nothing can reclaim.
-if [[ "${BU_SWEEP_SYNC:-0}" == "1" ]]; then
+# startup and can strand tabs whose records were already removed.
+# Bash 3 (the macOS default) has no BASHPID, so keep its sweep in the
+# foreground where $$ identifies the lock holder correctly.
+if [[ "${BU_SWEEP_SYNC:-0}" == "1" || -z "${BASHPID:-}" ]]; then
   sweep_expired_sessions
 else
   sweep_expired_sessions >/dev/null 2>&1 &
 fi
 
-{
+run_browser_command < <(
   cat "$bu_skill_dir/session_prelude.py"
   cat
-} | browser-use
+)

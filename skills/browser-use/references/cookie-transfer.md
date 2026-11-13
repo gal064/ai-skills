@@ -1,8 +1,13 @@
-# In-memory cookie transfer
+# In-memory site login transfer
 
-Use this workflow only after reading it completely. Cookies are authentication
-material. Transfer them directly between live CDP endpoints; never write cookie
-values to disk, logs, chat, or source control.
+Use this workflow only after reading it completely. Cookies and localStorage
+can contain authentication material. Transfer them directly between live CDP
+endpoints; never write their values to disk, logs, chat, or source control.
+
+A request to copy a site login or session authorizes cookies and localStorage
+for that exact site origin by default. Include both from the first attempt
+without asking for separate localStorage approval. An explicit cookies-only
+request limits the transfer to cookies.
 
 ## Fast path
 
@@ -12,7 +17,7 @@ the SSH tunnel, transfers in memory, and optionally checks a page:
 
 ```bash
 node "$(bu skill-dir)/scripts/sync-cookies.mjs" \
-  --domain example.com --profile person@example.com --to devbox \
+  --domain example.com --local-storage-origin https://example.com --profile person@example.com --to devbox \
   --check https://example.com/account --expect "Sign out"
 ```
 
@@ -27,30 +32,65 @@ node "$(bu skill-dir)/scripts/sync-cookies.mjs" \
   page counts as evidence of login; without it the result says
   `loggedIn: unknown`, because a page that does not redirect is not proof.
 
-When the user gives the domains, the destination, and the profile, that is the
-scope confirmation. `--all` still needs the all-cookie warning below before you
-run it. When you choose any of them yourself, confirm first as described below. Use the manual workflow when the fast path does not
-fit, such as a source that is not a local user-data directory.
+When the user gives the site, the destination, and the profile, that is the
+scope confirmation for its cookies and exact-origin localStorage. Resolve the
+origin from the supplied site URL. If only a domain is supplied, use its HTTPS
+origin when unambiguous; clarify if the intended origin is ambiguous. Do not
+add related origins. `--all` still needs the all-cookie warning below before
+you run it and does not authorize copying localStorage for every site. When
+you choose the site, destination, or profile yourself, confirm first as
+described below. Use the manual workflow when the fast path does not fit, such
+as a source that is not a local user-data directory.
 
 ## Confirm scope first
 
-Before reading or writing cookies, explicitly confirm:
+Before reading or writing cookies or localStorage, resolve the following from
+the user's request and existing session context. Ask only for missing or
+ambiguous scope:
 
 1. Source machine, browser, and exact profile or live CDP endpoint.
 2. Destination machine and exact dedicated profile or live CDP endpoint.
 3. Either an exact normalized domain allowlist or an explicit request to copy
-   every cookie. Never infer related domains.
-4. Merge behavior. This workflow only merges matching cookie identities; it
-   never clears destination cookies.
+   every cookie, plus the exact site origin for localStorage when copying a
+   login or session. Never infer related domains or origins.
+4. Merge behavior. This workflow only merges matching cookie identities and
+   localStorage keys; it never clears destination cookies or localStorage.
 
 All-cookie transfer requires a specific warning that it copies authentication
 for every cookie-backed site in the source profile. Site-scoped transfer is the
 recommended default. State the resolved source, destination, and scope before
 starting.
 
-Cookie transfer may not establish authentication for sites that depend on
-localStorage, IndexedDB, device binding, or another mechanism. Moving any
-non-cookie storage requires separate explicit authorization.
+Cookies and localStorage may not establish authentication for sites that
+depend on IndexedDB, device binding, or another mechanism. Moving storage
+other than cookies and the scoped localStorage requires separate explicit
+authorization.
+
+## localStorage
+
+Some sites keep the login token in localStorage (Memberstack's `_ms-mid`, for
+example), so cookies alone leave the destination logged out. For a site login
+or session transfer, add `--local-storage-origin` to either script by default
+for the exact origin in scope. The scripts require this flag explicitly; they
+do not infer origins. Repeat it only for additional origins the user requested:
+
+```bash
+node "$(bu skill-dir)/scripts/sync-cookies.mjs" \
+  --domain example.com --local-storage-origin https://app.example.com \
+  --profile person@example.com --to devbox
+```
+
+It copies every localStorage key of that origin from the served source profile
+and merges them into the destination without clearing other keys. Each side
+reads or writes through a background tab whose document is a blank page served
+by Fetch interception, so the site's own scripts never run there, and the tab
+is closed afterwards. The result reports counts per origin only. Every origin
+is read before anything is written, so a source origin with no entries fails
+the run without merging cookies or localStorage. If the scoped origin has no
+localStorage entries, retry with cookies alone; no extra approval is needed.
+Extension content scripts
+still run in that tab, so keys they write on the origin are copied too.
+IndexedDB and sessionStorage are not copied.
 
 ## Make both profiles available through CDP
 
@@ -102,8 +142,10 @@ For exact domains:
 node "$(bu skill-dir)/scripts/transfer-cookies.mjs" \
   --source-user-data-dir SOURCE_USER_DATA_DIR \
   --destination-cdp-url DESTINATION_CDP_URL \
-  --domain example.com
+  --domain example.com --local-storage-origin https://example.com
 ```
+
+For an explicit cookies-only request, omit `--local-storage-origin`.
 
 Repeat `--domain` only for separately confirmed suffixes. A cookie for
 `sub.example.com` matches `example.com`; unrelated suffixes do not.
@@ -134,9 +176,9 @@ connection and is never copied to a temporary file.
 
 ## Verify
 
-The imported and verified counts must match. This proves the destination
-contains the selected cookie identities and values, not that the web account is
-authenticated.
+The imported and verified counts must match for cookies and each transferred
+localStorage origin. This proves the destination contains the selected
+identities and values, not that the web account is authenticated.
 
 If authentication verification was requested, check it from a tab your own
 session owns, following the skill's owned-tab model. Never drive or close a tab

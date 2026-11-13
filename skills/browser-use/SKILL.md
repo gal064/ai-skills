@@ -23,11 +23,32 @@ checks, or helper discovery first. If the user explicitly asks to connect to
 their main browser, use the `browser-use` CLI directly and bypass the `bu`
 wrapper and workflow; otherwise, use `bu`.
 
+`bu` always uses the same persistent profile. Only when the user asks for incognito, open a logged-out context inside it instead of a new profile, so no folder is left behind:
+
+```bash
+bu root_incognito_a7c3 <<'PY'
+ctx = cdp("Target.createBrowserContext")["browserContextId"]
+try:
+    tid = cdp("Target.createTarget", url="about:blank", browserContextId=ctx, background=True)["targetId"]
+    switch_tab(tid)
+    goto_url("https://example.com/")
+    wait_for_load()
+    wait_for_network_idle()
+    # Perform only the browser actions the user requested.
+finally:
+    cdp("Target.disposeBrowserContext", browserContextId=ctx)
+PY
+```
+
+The context shares no cookies or logins with the profile, and disposing it discards everything from the visit. Create the tab blank and then navigate: passing the URL to `Target.createTarget` races with attaching. Keep `wait_for_network_idle()`: some sites redirect right after the first load, and `wait_for_load()` alone can return on the page being replaced.
+
 When running `bu` from Codex, execute every `bu` command with host permissions (`sandbox_permissions="require_escalated"`). `bu` requires access to files outside the sandbox.
 
 Do not use this skill for logged-in social media or Google services without explicit user approval; automated activity could get the account banned. It is safe to use for B2B apps, logged-out sessions, and similar low-risk browsing.
 
-For any cookie import, export, or transfer, read `references/cookie-transfer.md` completely before acting.
+Do not open social media sites in logged-in mode unless clearly instructed, to avoid bans. Incognito is fine.
+
+For any cookie import, export, or transfer, read `references/cookie-transfer.md` completely before acting. A request to copy a site login or session includes cookies and localStorage for that exact site origin by default; do not ask for separate localStorage approval. Honor an explicit cookies-only request.
 
 ## Owned sessions and tabs
 
@@ -152,6 +173,11 @@ Raw CDP is available through `cdp("Domain.method", ...)`. Use it when a normal
 helper is insufficient, not as a reason to bypass the owned-tab model or invent
 cross-frame JavaScript walkers.
 
+`bu` leaves the CDP Runtime domain off so pages do not detect automation through
+it, which means no `Runtime.*` events such as console messages. `js(...)` and
+`Runtime.evaluate` still work. Call `cdp("Runtime.enable")` only when the task
+needs those events, because pages can detect it until the tab closes.
+
 Start with the normal `scroll(...)` helper. A scroll timeout is not permission
 to foreground Chrome. Read the scrolling reference before retrying with focus
 emulation, and call `activate_tab` only when the user explicitly asks to see the
@@ -211,12 +237,26 @@ bu root_research_a7c3 --end
 ```
 
 That closes every tab the session owns, stops its daemon, and clears its saved
-state. `--reload` is an alias for `--end`. Every `bu` call that runs browser code also
+state. After the final session ends, `bu` also gracefully closes its dedicated
+Chrome when no browser command is running and no page tabs remain. Another
+session or an unowned page keeps Chrome running. The next call starts Chrome
+again with the same saved profile and logins, without opening an extra startup
+window; session daemons create their own tabs. Explicit `BU_CDP_URL` browsers
+are never shut down automatically. `--reload` is an alias for `--end`. Every `bu` call that runs browser code also
 ends any session idle longer than `BU_SESSION_TTL` seconds (default 3600; `0`
 disables sweeping), so an abandoned workflow does not keep tabs open once the
 tool is used again. Idle time runs from the start of a call, so keep the TTL
 above the duration of your longest single call or a still-running session can
 be swept. Reusing a session ID resumes its tabs while they still exist.
+
+Unassigned page tabs, including popups an agent never switched into, are
+recorded after browser commands and expire after `BU_SESSION_TTL` seconds
+(default 3600) since first observed unassigned. Expiry runs on later code or
+session-ending calls, never on a timer. Assigned tabs stay protected, and
+another running browser command defers unassigned-tab closure. Setting
+`BU_SESSION_TTL=0` disables expiry. Existing untracked tabs start a fresh clock
+when first observed; saved ages reset when Chrome restarts. Explicit
+`BU_CDP_URL` browsers are excluded. Read-only status checks do not trigger expiry.
 
 Do not move, copy, rename, stop, or relaunch the configured profile during
 browser work. On failure, run `bu doctor`.
